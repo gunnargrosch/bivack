@@ -1,5 +1,5 @@
 #!/bin/bash
-# Connect an interactive shell to a user's rDev MicroVM.
+# Connect an interactive shell to a user's Bivack MicroVM.
 # Usage: ./tools/exec.sh --user <email> [--root]
 set -euo pipefail
 DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
