@@ -851,7 +851,7 @@ Outputs:
     Description: >-
       Fallback for creating a login by hand. deploy.sh creates the first user
       automatically; use this only to add or reset a user later.
-    Value: !Sub "aws cognito-idp admin-create-user --user-pool-id ${UserPool} --username ${LoginEmail} --user-attributes Name=email,Value=${LoginEmail} Name=email_verified,Value=true --temporary-password 'ChangeMe-123!'"
+    Value: !Sub "aws cognito-idp admin-create-user --user-pool-id ${UserPool} --username ${LoginEmail} --user-attributes Name=email,Value=${LoginEmail} Name=email_verified,Value=true --temporary-password 'YOUR_TEMP_PASSWORD'"
   FrontendUrl:
     Value: !Sub "https://${FrontendDistribution.DomainName}"
   FrontendBucketName:

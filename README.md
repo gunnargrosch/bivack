@@ -112,6 +112,7 @@ All of them share workspace files while keeping their own configuration and hist
 | `AWS_PROFILE` | named AWS CLI profile (leave unset for the default profile) |
 | `AWS_REGION` | region to deploy into |
 | `LOGIN_EMAIL` | first Cognito login; deploy.sh creates it, and the monthly budget alerts here by default |
+| `INITIAL_PASSWORD` | optional; temporary password for the first login, default random |
 | `STACK_NAME` | optional, defaults to `bivack`; prefixes every AWS resource |
 | `MEMORY_MIB` | optional; MicroVM memory tier (512, 1024, 2048, 4096, 8192), default 4096 |
 | `IDLE_MAX_SECONDS` | optional; seconds without inbound traffic before a VM suspends, default 7200 |
@@ -129,7 +130,7 @@ All of them share workspace files while keeping their own configuration and hist
 3. Builds the IDE when its sources changed (or `ide/dist` is missing).
 4. Packages `microvm/` and deploys the stack with the image.
 5. Uploads the frontend and IDE to S3 and invalidates CloudFront.
-6. Creates the first login from `LOGIN_EMAIL` (temporary password `ChangeMe-123!`, changed on first sign-in).
+6. Creates the first login from `LOGIN_EMAIL` with a random temporary password, printed once by the deploy and changed on first sign-in.
 7. Launches a throwaway MicroVM, probes the S3 Files mount and outbound internet, then terminates it.
 
 ### Flags

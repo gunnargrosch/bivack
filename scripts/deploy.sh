@@ -59,6 +59,10 @@ BUDGET_USD="${BUDGET_USD:-25}"
 BUDGET_ENABLED="${BUDGET_ENABLED:-true}"
 BUDGET_EMAIL="${BUDGET_EMAIL:-}"
 NAT_MODE="${NAT_MODE:-instance}"
+# Temporary password for the first auto-created login. Random by default;
+# override with INITIAL_PASSWORD in deploy.env. The pool policy needs 12+ chars
+# with upper, lower, and a digit, so build a value that always satisfies it.
+INITIAL_PASSWORD="${INITIAL_PASSWORD:-$(python3 -c 'import secrets,string; a=string.ascii_letters+string.digits; pw=[secrets.choice(string.ascii_uppercase),secrets.choice(string.ascii_lowercase),secrets.choice(string.digits)]+[secrets.choice(a) for _ in range(13)]; secrets.SystemRandom().shuffle(pw); print("".join(pw))')}"
 SAM_PROFILE=()
 [ -n "${AWS_PROFILE:-}" ] && SAM_PROFILE=(--profile "$AWS_PROFILE")
 PARAM_OVERRIDES="LoginEmail=\"$LOGIN_EMAIL\" MicrovmMemoryMiB=$MEMORY_MIB IdleMaxSeconds=$IDLE_MAX_SECONDS IdleSuspendSeconds=$IDLE_SUSPEND_SECONDS MaxLifetimeSeconds=$MAX_LIFETIME_SECONDS MonthlyBudgetUsd=$BUDGET_USD BudgetEnabled=$BUDGET_ENABLED BudgetEmail=\"$BUDGET_EMAIL\" NatMode=$NAT_MODE"
@@ -270,7 +274,7 @@ fi
 ok "Frontend uploaded and CDN invalidated"
 
 # ── First login user ──────────────────────────────────────────────────────────
-CREATE_USER_CMD="aws cognito-idp admin-create-user --user-pool-id $USER_POOL_ID --username $LOGIN_EMAIL --user-attributes Name=email,Value=$LOGIN_EMAIL Name=email_verified,Value=true --temporary-password 'ChangeMe-123!'"
+CREATE_USER_CMD="aws cognito-idp admin-create-user --user-pool-id $USER_POOL_ID --username $LOGIN_EMAIL --user-attributes Name=email,Value=$LOGIN_EMAIL Name=email_verified,Value=true --temporary-password 'YOUR_TEMP_PASSWORD'"
 FIRST_USER_CREATED=false
 if [ -n "$USER_POOL_ID" ] && [ "$USER_POOL_ID" != "None" ] && [ -n "$LOGIN_EMAIL" ] \
    && [ "$LOGIN_EMAIL" != "you@example.com" ]; then
@@ -281,8 +285,8 @@ if [ -n "$USER_POOL_ID" ] && [ "$USER_POOL_ID" != "None" ] && [ -n "$LOGIN_EMAIL
     aws cognito-idp admin-create-user --user-pool-id "$USER_POOL_ID" \
       --username "$LOGIN_EMAIL" \
       --user-attributes Name=email,Value="$LOGIN_EMAIL" Name=email_verified,Value=true \
-      --temporary-password 'ChangeMe-123!' >/dev/null
-    ok "  user created (temporary password ChangeMe-123!)"
+      --temporary-password "$INITIAL_PASSWORD" >/dev/null
+    ok "  user created (temporary password: $INITIAL_PASSWORD)"
     FIRST_USER_CREATED=true
   else
     ok "User pool already has users"
@@ -366,15 +370,17 @@ else
   echo "  Bivack — deployed"
 fi
 echo "  URL:        $FRONTEND_URL"
-[ -n "$LOGIN_EMAIL" ] && echo "  Login:      $LOGIN_EMAIL (temporary password ChangeMe-123! on first sign-in)"
+[ -n "$LOGIN_EMAIL" ] && echo "  Login:      $LOGIN_EMAIL"
 echo "  Smoke test: $MVM_STATE"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 if [ "$FIRST_USER_CREATED" = true ]; then
   echo "First sign-in: open the URL, sign in as $LOGIN_EMAIL with the temporary"
-  echo "password ChangeMe-123!, and set a new password when prompted."
+  echo "password below, and set a new password when prompted."
+  echo ""
+  echo "  Temporary password: $INITIAL_PASSWORD"
 else
-  echo "Create or reset a login with:"
+  echo "Create or reset a login with (replace YOUR_TEMP_PASSWORD):"
   echo "  $CREATE_USER_CMD"
 fi
 echo ""
