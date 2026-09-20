@@ -1,190 +1,188 @@
 #!/bin/bash
-# End-to-end deploy for ipad-claude
-# Usage: ./scripts/deploy.sh [--skip-infra] [--skip-mvm]
-#   --skip-infra   reuse the existing SAM stack (skip sam build/deploy and the
-#                  MicroVM image entirely — frontend sync + smoke test only)
-#   --skip-mvm     skip the throwaway smoke-test VM
+# One-command deploy for Bivack. Re-running it on an existing stack upgrades it
+# in place; the S3 Files home and the buckets are preserved. See the README
+# "Upgrading" section.
 #
-# No project-specific config file for profile/region/account: sam build and
-# sam deploy read stack_name/region/profile from samconfig.toml on their own
-# (that's what it's for — see samconfig.toml.example). This script's own raw
-# `aws` calls (the web-search gateway, S3 uploads, the smoke test — none of
-# which are `sam` commands, so samconfig.toml doesn't apply to them) rely on
-# the SAME standard AWS CLI resolution every script does: AWS_PROFILE /
-# AWS_REGION env vars, or your default profile. Export them once, or run
-# `AWS_PROFILE=... AWS_REGION=... ./scripts/deploy.sh` — nothing here parses
-# a config file to re-derive them.
+#   ./scripts/deploy.sh                 build what changed, deploy, smoke test
+#   ./scripts/deploy.sh --frontend-only re-upload the frontend + IDE only
+#   ./scripts/deploy.sh --no-smoke      skip the throwaway smoke-test VM
+#   ./scripts/deploy.sh --build-ide     force an IDE rebuild
+#   ./scripts/deploy.sh --review        show the changeset and confirm before applying
 #
-# The MicroVM image is a real CFN resource (AWS::Serverless::MicrovmImage) in
-# template.yaml, not a hand-rolled aws lambda-microvms CLI dance — its own
-# configuration (name, memory tier, capabilities, base image) lives entirely
-# as literals on that resource, not here. There's no --skip-image /
-# --recreate-image: if microvm/ hasn't changed, its content hash produces the
-# same S3 key, CodeUri comes out identical, and CloudFormation no-ops the
-# resource on its own. Changing AdditionalOsCapabilities is now a normal
-# in-place update too (the CLI required delete+recreate for that).
+# Configuration lives in deploy.env (untracked; created from deploy.env.example
+# on first run).
 set -euo pipefail
 
-# Resolve repo root from this script's location (no hardcoded path).
-# Unset CDPATH first: if it's set in the user's env, `cd` echoes the target
-# dir to stdout, which would corrupt the command substitution below.
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(unset CDPATH; cd "$SCRIPT_DIR/.." && pwd)"
 
-# Fixed identifier for this app's stack — matches samconfig.toml's own
-# stack_name literal (the two are independent tools/files, kept in sync by
-# hand; this rarely changes). Not a config knob.
-STACK_NAME="ipad-claude"
-
-SKIP_INFRA=false
-SKIP_MVM=false
-for arg in "$@"; do
-  case $arg in
-    --skip-infra) SKIP_INFRA=true ;;
-    --skip-mvm)   SKIP_MVM=true ;;
+FRONTEND_ONLY=false
+NO_SMOKE=false
+BUILD_IDE=false
+REVIEW=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --frontend-only) FRONTEND_ONLY=true; shift ;;
+    --no-smoke)      NO_SMOKE=true; shift ;;
+    --build-ide)     BUILD_IDE=true; shift ;;
+    --review)        REVIEW=true; shift ;;
+    -h|--help)       sed -n '2,11p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-log() { echo -e "\033[1;36m▶ $*\033[0m"; }
-ok()  { echo -e "\033[1;32m✓ $*\033[0m"; }
-err() { echo -e "\033[1;31m✗ $*\033[0m" >&2; }
+log()  { echo -e "\033[1;36m▶ $*\033[0m"; }
+ok()   { echo -e "\033[1;32m✓ $*\033[0m"; }
+err()  { echo -e "\033[1;31m✗ $*\033[0m" >&2; }
 
-# ── Show resolved AWS identity (no config-driven gate — just visual confirmation) ─
-log "Resolving AWS identity (from your default profile/env — see the header comment)..."
-CALLER=$(aws sts get-caller-identity --output json)
-CALLER_ACCOUNT=$(echo "$CALLER" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+# ── Config ────────────────────────────────────────────────────────────────────
+if [ -f "$ROOT_DIR/deploy.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT_DIR/deploy.env"
+  set +a
+else
+  cp "$ROOT_DIR/deploy.env.example" "$ROOT_DIR/deploy.env"
+  err "Created deploy.env — fill in AWS_PROFILE, AWS_REGION and LOGIN_EMAIL, then run this again."
+  exit 1
+fi
+
+STACK_NAME="${STACK_NAME:-bivack}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+LOGIN_EMAIL="${LOGIN_EMAIL:-}"
+# Runtime knobs, overridable in deploy.env. Defaults match the template.
+MEMORY_MIB="${MEMORY_MIB:-4096}"
+IDLE_MAX_SECONDS="${IDLE_MAX_SECONDS:-7200}"
+IDLE_SUSPEND_SECONDS="${IDLE_SUSPEND_SECONDS:-1800}"
+MAX_LIFETIME_SECONDS="${MAX_LIFETIME_SECONDS:-28800}"
+BUDGET_USD="${BUDGET_USD:-25}"
+BUDGET_ENABLED="${BUDGET_ENABLED:-true}"
+BUDGET_EMAIL="${BUDGET_EMAIL:-}"
+NAT_MODE="${NAT_MODE:-instance}"
+SAM_PROFILE=()
+[ -n "${AWS_PROFILE:-}" ] && SAM_PROFILE=(--profile "$AWS_PROFILE")
+PARAM_OVERRIDES="LoginEmail=\"$LOGIN_EMAIL\" MicrovmMemoryMiB=$MEMORY_MIB IdleMaxSeconds=$IDLE_MAX_SECONDS IdleSuspendSeconds=$IDLE_SUSPEND_SECONDS MaxLifetimeSeconds=$MAX_LIFETIME_SECONDS MonthlyBudgetUsd=$BUDGET_USD BudgetEnabled=$BUDGET_ENABLED BudgetEmail=\"$BUDGET_EMAIL\" NatMode=$NAT_MODE"
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+missing=()
+for tool in aws sam node npm zip python3; do
+  command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+  err "Missing required tools: ${missing[*]}"
+  echo "  Install: awscli (https://aws.amazon.com/cli), sam (https://docs.aws.amazon.com/serverless-application-model),"
+  echo "           node 20+, zip, python3."
+  exit 1
+fi
+
+log "Checking AWS credentials..."
+if ! CALLER=$(aws sts get-caller-identity --output json 2>/dev/null); then
+  err "No working AWS credentials. Run 'aws configure' or 'aws sso login' for profile '${AWS_PROFILE:-default}'."
+  exit 1
+fi
 CALLER_ARN=$(echo "$CALLER" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
-ok "Authenticated as $CALLER_ARN (account $CALLER_ACCOUNT) — Ctrl+C now if that's wrong"
+CALLER_ACCOUNT=$(echo "$CALLER" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+ok "Deploying to account $CALLER_ACCOUNT as $CALLER_ARN"
 
-out() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text 2>/dev/null || echo ""; }
+out() {
+  aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text 2>/dev/null || true
+}
+stack_exists() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; }
 
-# ── AgentCore web-search gateway + MicroVM image inputs ────────────────────────
-# Both MicrovmCodeUri and WebSearchGatewayUrl are inputs the MicrovmImage
-# resource needs, but neither can be computed by CloudFormation itself — the
-# gateway isn't in the template (see WebSearchGatewayRole's comment), and the
-# image's CodeUri needs a real, already-uploaded S3 object before `sam deploy`
-# can create/update the resource. So both must be resolved BEFORE the deploy
-# call, from the stack's EXISTING state (ArtifactBucketName, WebSearchGateway-
-# RoleArn don't change identity across updates). This only works when the
-# stack already exists — bootstrapping a truly first-ever deploy needs those
-# two resources (the bucket, the role) created by a preceding `sam deploy`
-# first; see the README for that one-time sequence.
-WEBSEARCH_GATEWAY_URL=""
-MICROVM_CODE_URI=""
-if [ "$SKIP_INFRA" = false ]; then
+sam_build() {
+  log "Building SAM application..."
+  # No --cached and no stale build dir: a cached .aws-sam/build/template.yaml
+  # once shipped an old template while the CLI parameter overrides looked new,
+  # so a template edit (removing resources) silently did not apply. Always
+  # regenerate the built template from source.
+  rm -rf "$ROOT_DIR/.aws-sam/build"
+  (cd "$ROOT_DIR" && sam build --parallel --template template.yaml)
+}
+sam_deploy() {
+  # --review keeps sam's own changeset prompt so stateful replacements are
+  # visible before they are applied. Default is to deploy without prompting.
+  local confirm=()
+  [ "$REVIEW" = false ] && confirm=(--no-confirm-changeset)
+  (cd "$ROOT_DIR" && sam deploy \
+    --stack-name "$STACK_NAME" --region "$AWS_REGION" ${SAM_PROFILE[@]+"${SAM_PROFILE[@]}"} \
+    --capabilities CAPABILITY_NAMED_IAM --resolve-s3 \
+    ${confirm[@]+"${confirm[@]}"} --no-fail-on-empty-changeset \
+    --parameter-overrides "$@")
+}
+
+if [ "$FRONTEND_ONLY" = true ] && ! stack_exists; then
+  err "Stack '$STACK_NAME' does not exist; --frontend-only needs an existing deploy."
+  exit 1
+fi
+
+# ── First-ever deploy: bootstrap the stack so it has an artifact bucket ───────
+if ! stack_exists; then
+  log "First deploy: bootstrapping stack (no MicroVM image yet)..."
+  sam_build
+  sam_deploy "DeployMicrovmImage=false $PARAM_OVERRIDES"
+  ok "Bootstrap complete"
+fi
+
+# ── Build the IDE when its sources changed ────────────────────────────────────
+# ide/dist is git-ignored, so a git pull never updates it. Compare a hash of the
+# IDE inputs against the last build and rebuild on any change, so a plain
+# upgrade (git pull && ./scripts/deploy.sh) ships the new workbench.
+if [ "$FRONTEND_ONLY" = false ]; then
+  IDE_HASH=$(cd "$ROOT_DIR/ide" && {
+    /usr/bin/find src -type f 2>/dev/null
+    printf '%s\n' index.html package.json package-lock.json vite.config.ts tsconfig.json
+  } | LC_ALL=C sort | xargs cat 2>/dev/null | shasum -a 256 | cut -c1-16)
+  IDE_STAMP_FILE="$ROOT_DIR/ide/.build-hash"
+  IDE_STAMP=$(cat "$IDE_STAMP_FILE" 2>/dev/null || echo "")
+  if [ "$BUILD_IDE" = true ] || [ ! -d "$ROOT_DIR/ide/dist" ] || [ "$IDE_HASH" != "$IDE_STAMP" ]; then
+    log "Building the IDE (npm ci && npm run build)..."
+    (cd "$ROOT_DIR/ide" && npm ci && npm run build)
+    printf '%s' "$IDE_HASH" > "$IDE_STAMP_FILE"
+    ok "IDE built"
+  else
+    ok "IDE up to date"
+  fi
+fi
+
+# ── Package the MicroVM source and deploy the stack ───────────────────────────
+if [ "$FRONTEND_ONLY" = false ]; then
   ARTIFACT_BUCKET=$(out ArtifactBucketName)
-  WEBSEARCH_GW_ROLE_ARN=$(out WebSearchGatewayRoleArn)
-
-  if [ -z "$ARTIFACT_BUCKET" ] || [ -z "$WEBSEARCH_GW_ROLE_ARN" ]; then
-    err "Stack '$STACK_NAME' not found (or missing outputs) — this looks like a" \
-        "first-ever deploy. See the README's bootstrap note before running" \
-        "deploy.sh: the stack needs one initial 'sam deploy' to create the" \
-        "artifact bucket and the web-search gateway role before this script's" \
-        "two-way dependency (image needs the bucket, gateway needs the role,"\
-        "both need the stack) can resolve."
+  if [ -z "$ARTIFACT_BUCKET" ] || [ "$ARTIFACT_BUCKET" = "None" ]; then
+    err "Stack is missing the artifact bucket output; delete the stack and retry."
     exit 1
   fi
 
-  log "Ensuring AgentCore web-search gateway..."
-  GATEWAY_NAME="ipadclaudewebsearch"
-  GATEWAY_ID=$(aws bedrock-agentcore-control list-gateways \
-    --query "items[?name=='$GATEWAY_NAME'].gatewayId | [0]" --output text 2>/dev/null || echo "")
-
-  if [ -z "$GATEWAY_ID" ] || [ "$GATEWAY_ID" = "None" ]; then
-    log "Creating AgentCore gateway '$GATEWAY_NAME'..."
-    GW_OUT=$(aws bedrock-agentcore-control create-gateway \
-      --name "$GATEWAY_NAME" \
-      --protocol-type MCP \
-      --authorizer-type AWS_IAM \
-      --role-arn "$WEBSEARCH_GW_ROLE_ARN" \
-      --output json)
-    GATEWAY_ID=$(echo "$GW_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['gatewayId'])")
-    WEBSEARCH_GATEWAY_URL=$(echo "$GW_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['gatewayUrl'])")
-
-    for i in $(seq 1 30); do
-      GW_STATUS=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GATEWAY_ID" \
-        --query status --output text 2>/dev/null || echo "UNKNOWN")
-      [ "$GW_STATUS" = "READY" ] && break
-      sleep 2
-    done
-    if [ "$GW_STATUS" != "READY" ]; then
-      err "Gateway stuck in $GW_STATUS"; exit 1
-    fi
-
-    log "Adding web-search connector target..."
-    aws bedrock-agentcore-control create-gateway-target \
-      --gateway-identifier "$GATEWAY_ID" \
-      --name "websearch" \
-      --target-configuration '{"mcp":{"connector":{"source":{"connectorId":"web-search"},"configurations":[{"name":"WebSearch","parameterValues":{}}]}}}' \
-      --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
-      --output json > /dev/null
-
-    for i in $(seq 1 30); do
-      TGT_STATUS=$(aws bedrock-agentcore-control list-gateway-targets --gateway-identifier "$GATEWAY_ID" \
-        --query "items[0].status" --output text 2>/dev/null || echo "UNKNOWN")
-      [ "$TGT_STATUS" = "READY" ] && break
-      sleep 2
-    done
-    ok "Web-search gateway created: $GATEWAY_ID (target: $TGT_STATUS)"
-  else
-    WEBSEARCH_GATEWAY_URL=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GATEWAY_ID" \
-      --query gatewayUrl --output text 2>/dev/null || echo "")
-    ok "Web-search gateway exists: $GATEWAY_ID"
-  fi
-  ok "Web-search MCP endpoint: $WEBSEARCH_GATEWAY_URL"
-
-  # ── Package the MicroVM image source and compute its content-hash S3 key ────
-  # CloudFormation only diffs property VALUES. AWS::Serverless::MicrovmImage
-  # isn't in SAM's local-file auto-upload list (unlike Function's CodeUri,
-  # which SAM content-hashes automatically) — so if this always uploaded to
-  # the SAME key, a real microvm/ change would produce an IDENTICAL CodeUri
-  # string and CloudFormation would silently skip rebuilding. Hashing the zip
-  # into the key name replicates what SAM does for Functions, by hand.
+  # MicrovmCodeUri must be a real, already-uploaded object before `sam deploy`
+  # runs. CloudFormation only diffs property values and this resource is not in
+  # SAM's auto-upload list, so the S3 key carries a content hash: a real
+  # microvm/ change changes the URI and triggers a rebuild, no change no-ops.
   log "Packaging MicroVM source..."
-  BUILD_DIR="/tmp/remote-dev-microvm-build"
+  BUILD_DIR="/tmp/bivack-microvm-build"
   rm -rf "$BUILD_DIR"; cp -R "$ROOT_DIR/microvm" "$BUILD_DIR"
-  # Render the account-specific FS id into the copy only — never commit it.
   S3_FILES_FS_ID=$(out S3FilesFileSystemId)
   sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$BUILD_DIR/Dockerfile"
   rm -f "$BUILD_DIR/Dockerfile.bak"
-
-  ZIP_PATH="/tmp/remote-dev-microvm.zip"
+  find "$BUILD_DIR" -exec touch -t 202001010000.00 {} + 2>/dev/null || true
+  ZIP_PATH="/tmp/bivack-microvm.zip"
   rm -f "$ZIP_PATH"
   (cd "$BUILD_DIR" && zip -r "$ZIP_PATH" . -x "*.DS_Store" > /dev/null)
-  ZIP_HASH=$(shasum -a 256 "$ZIP_PATH" | cut -c1-16)
-  ZIP_KEY="microvm/remote-dev-microvm-${ZIP_HASH}.zip"
+  ZIP_HASH=$(cd "$BUILD_DIR" && /usr/bin/find . -type f -print0 \
+    | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
+  ZIP_KEY="microvm/bivack-microvm-${ZIP_HASH}.zip"
   MICROVM_CODE_URI="s3://$ARTIFACT_BUCKET/$ZIP_KEY"
+  aws s3 cp "$ZIP_PATH" "s3://$ARTIFACT_BUCKET/$ZIP_KEY" >/dev/null
+  ok "Source uploaded ($ZIP_KEY)"
 
-  aws s3 cp "$ZIP_PATH" "s3://$ARTIFACT_BUCKET/$ZIP_KEY"
-  ok "Source uploaded to $MICROVM_CODE_URI"
-fi
-
-# ── Infrastructure + MicroVM image: SAM build + deploy ─────────────────────────
-# No --profile/--region/--stack-name here — sam reads all three from
-# samconfig.toml on its own. --parameter-overrides supplies ONLY the two
-# values that are genuinely computed above; anything else set via
-# samconfig.toml's own parameter_overrides (e.g. LoginEmail) is retained
-# unchanged by CloudFormation, since it isn't mentioned in this list.
-if [ "$SKIP_INFRA" = false ]; then
-  log "Building SAM application..."
-  (cd "$ROOT_DIR" && sam build --template template.yaml)
-
-  log "Deploying SAM stack (this includes the MicroVM image build if microvm/" \
-      "changed — CloudFormation waits for it, ~5-10 min on a real change)..."
-  (cd "$ROOT_DIR" && sam deploy \
-    --parameter-overrides "MicrovmCodeUri=$MICROVM_CODE_URI WebSearchGatewayUrl=$WEBSEARCH_GATEWAY_URL" \
-    --no-confirm-changeset --no-fail-on-empty-changeset)
-  ok "SAM stack deployed"
+  log "Deploying stack (a MicroVM image build here can take 5-10 min)..."
+  sam_build
+  sam_deploy "MicrovmCodeUri=$MICROVM_CODE_URI DeployMicrovmImage=true $PARAM_OVERRIDES"
+  ok "Stack deployed"
 else
-  log "Skipping infra (--skip-infra), using existing stack outputs..."
+  log "Frontend-only: reusing existing stack."
 fi
 
-# ── Read stack outputs (SAM creates a normal CloudFormation stack) ────────────
-# TokenApiUrl/FrontendUrl/UserPoolId/LoginEmail/CreateUserCommand etc. were
-# already printed by `sam deploy` itself moments ago (when --skip-infra is
-# false) — only re-read here what deploy.sh actually NEEDS to act on: the
-# frontend sync and the smoke test.
+# ── Read outputs ──────────────────────────────────────────────────────────────
 EXECUTION_ROLE=$(out ExecutionRoleArn)
 FRONTEND_BUCKET=$(out FrontendBucketName)
 CF_DIST_ID=$(out CloudFrontDistributionId)
@@ -194,67 +192,129 @@ TOKEN_API_URL=$(out TokenApiUrl)
 S3_FILES_FS_ID=$(out S3FilesFileSystemId)
 NETWORK_CONNECTOR_ARN=$(out NetworkConnectorArn)
 IMAGE_ID=$(out MicrovmImageArn)
+FRONTEND_URL=$(out FrontendUrl)
 
-# ── Inject runtime config into frontend (token API + Cognito ids) ─────────────
-# index.html ships with an APP_CONFIG placeholder; fill it at deploy time. We
-# render to a temp copy so the committed file keeps its placeholder (no
-# account-specific values ever land in git).
-log "Injecting runtime config into frontend..."
-FRONTEND_FILE="$ROOT_DIR/frontend/index.html"
-RENDERED=/tmp/ipad-claude-index.html
-APP_CONFIG_JSON="{\"tokenApiUrl\":\"$TOKEN_API_URL\",\"region\":\"$(aws configure get region 2>/dev/null || echo us-east-1)\",\"userPoolId\":\"$USER_POOL_ID\",\"userPoolClientId\":\"$USER_POOL_CLIENT_ID\"}"
-# Replace the whole placeholder <script> line with the injected config.
-sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<script>window.APP_CONFIG = $APP_CONFIG_JSON;</script>|" \
-  "$FRONTEND_FILE" > "$RENDERED"
+# ── Upload the frontend ───────────────────────────────────────────────────────
+# Version shown in the frontend footer and used for the update check.
+# RELEASE is the nearest tag (the "running version"); BUILD is a support id for
+# the tooltip. Never bake `-dirty`: it reflects the maintainer's working tree,
+# not something a user can act on.
+RELEASE=$(git -C "$ROOT_DIR" describe --tags --abbrev=0 2>/dev/null || echo dev)
+BUILD=$(git -C "$ROOT_DIR" describe --tags --always 2>/dev/null || echo dev)
+REPO_URL="${REPO_URL:-https://github.com/gunnargrosch/bivack}"
+APP_CONFIG_JSON="{\"tokenApiUrl\":\"$TOKEN_API_URL\",\"region\":\"$AWS_REGION\",\"userPoolId\":\"$USER_POOL_ID\",\"userPoolClientId\":\"$USER_POOL_CLIENT_ID\",\"release\":\"$RELEASE\",\"build\":\"$BUILD\",\"repo\":\"$REPO_URL\"}"
+render_page() {
+  local src="$1" key="$2"
+  local out_file="/tmp/bivack-render-$(echo "$key" | tr '/' '_')"
+  sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<script>window.APP_CONFIG = $APP_CONFIG_JSON;</script>|" \
+    "$src" > "$out_file"
+  aws s3 cp "$out_file" "s3://$FRONTEND_BUCKET/$key" \
+    --cache-control "no-cache, no-store, must-revalidate" --content-type "text/html" >/dev/null
+  rm -f "$out_file"
+}
 
-# Sync updated frontend (render replaces the placeholder file in the upload dir)
-log "Syncing frontend to S3 ($FRONTEND_BUCKET)..."
-cp "$RENDERED" "$ROOT_DIR/frontend/index.html.rendered"
-aws s3 cp "$RENDERED" "s3://$FRONTEND_BUCKET/index.html" \
-  --cache-control "no-cache, no-store, must-revalidate" \
-  --content-type "text/html"
-rm -f "$ROOT_DIR/frontend/index.html.rendered"
+log "Uploading frontend..."
+render_page "$ROOT_DIR/frontend/landing.html" "index.html"
+render_page "$ROOT_DIR/frontend/index.html"   "cli/index.html"
+render_page "$ROOT_DIR/frontend/login.html"   "login/index.html"
+[ -f "$ROOT_DIR/frontend/manifest.webmanifest" ] && aws s3 cp "$ROOT_DIR/frontend/manifest.webmanifest" \
+  "s3://$FRONTEND_BUCKET/cli/manifest.webmanifest" --cache-control "no-cache" --content-type "application/manifest+json" >/dev/null
+[ -f "$ROOT_DIR/frontend/sw.js" ] && aws s3 cp "$ROOT_DIR/frontend/sw.js" \
+  "s3://$FRONTEND_BUCKET/cli/sw.js" --cache-control "no-cache" --content-type "application/javascript" >/dev/null
+[ -f "$ROOT_DIR/frontend/icon.svg" ] && aws s3 cp "$ROOT_DIR/frontend/icon.svg" \
+  "s3://$FRONTEND_BUCKET/cli/icon.svg" --cache-control "max-age=86400" --content-type "image/svg+xml" >/dev/null
+# Stylesheets (vscode.css plus one per page).
+for css in "$ROOT_DIR"/frontend/*.css; do
+  aws s3 cp "$css" "s3://$FRONTEND_BUCKET/$(basename "$css")" \
+    --cache-control "no-cache" --content-type "text/css" >/dev/null
+done
 
-if [ -n "$CF_DIST_ID" ]; then
-  aws cloudfront create-invalidation \
-    --distribution-id "$CF_DIST_ID" \
-    --paths "/*" > /dev/null
+if [ -d "$ROOT_DIR/ide/dist" ]; then
+  log "Uploading the IDE..."
+  (
+    cd "$ROOT_DIR/ide/dist"
+    find . -type f | while read -r f; do
+      key="ide/${f#./}"
+      case "$key" in
+        ide/index.html|ide/config.json) cc="no-cache, no-store, must-revalidate" ;;
+        *) cc="public, max-age=31536000, immutable" ;;
+      esac
+      case "$f" in
+        *.js|*.css|*.json|*.html|*.svg|*.txt|*.map)
+          case "$f" in
+            *.js) ct="text/javascript" ;;
+            *.css) ct="text/css" ;;
+            *.json) ct="application/json" ;;
+            *.html) ct="text/html" ;;
+            *.svg) ct="image/svg+xml" ;;
+            *.txt) ct="text/plain" ;;
+            *.map) ct="application/json" ;;
+          esac
+          gzip -9 -c "$f" > /tmp/bivack-gz
+          aws s3 cp /tmp/bivack-gz "s3://$FRONTEND_BUCKET/$key" \
+            --content-encoding gzip --content-type "$ct" --cache-control "$cc" >/dev/null
+          ;;
+        *) aws s3 cp "$f" "s3://$FRONTEND_BUCKET/$key" --cache-control "$cc" >/dev/null ;;
+      esac
+    done
+  )
+  rm -f /tmp/bivack-gz
+  printf '%s' "$APP_CONFIG_JSON" > /tmp/bivack-ide-config.json
+  aws s3 cp /tmp/bivack-ide-config.json "s3://$FRONTEND_BUCKET/ide/config.json" \
+    --cache-control "no-cache" --content-type "application/json" >/dev/null
 fi
-ok "Frontend synced and CDN invalidated"
 
-# ── Smoke-test MicroVM (throwaway) ──────────────────────────────────────────────
-# Per-user MVMs are launched on demand by the token Lambda at login (keyed to
-# the Cognito user), NOT here. This launches ONE throwaway VM purely to smoke-
-# test the image end-to-end, then terminates it. To exercise the real per-user
-# mount path, we create a temporary access point and pass its id via
-# --run-hook-payload, exactly as the Lambda does.
-SMOKE_AP=""
-if [ "$SKIP_MVM" = false ]; then
-  if [ -z "$IMAGE_ID" ]; then
-    err "No MicrovmImageArn stack output — run without --skip-infra at least once first."
+if [ -n "$CF_DIST_ID" ] && [ "$CF_DIST_ID" != "None" ]; then
+  aws cloudfront create-invalidation --distribution-id "$CF_DIST_ID" --paths "/*" >/dev/null
+fi
+ok "Frontend uploaded and CDN invalidated"
+
+# ── First login user ──────────────────────────────────────────────────────────
+CREATE_USER_CMD="aws cognito-idp admin-create-user --user-pool-id $USER_POOL_ID --username $LOGIN_EMAIL --user-attributes Name=email,Value=$LOGIN_EMAIL Name=email_verified,Value=true --temporary-password 'ChangeMe-123!'"
+FIRST_USER_CREATED=false
+if [ -n "$USER_POOL_ID" ] && [ "$USER_POOL_ID" != "None" ] && [ -n "$LOGIN_EMAIL" ] \
+   && [ "$LOGIN_EMAIL" != "you@example.com" ]; then
+  user_count=$(aws cognito-idp list-users --user-pool-id "$USER_POOL_ID" \
+    --query 'Users | length(@)' --output text 2>/dev/null || echo 0)
+  if [ "$user_count" = "0" ]; then
+    log "Creating the first login user ($LOGIN_EMAIL)..."
+    aws cognito-idp admin-create-user --user-pool-id "$USER_POOL_ID" \
+      --username "$LOGIN_EMAIL" \
+      --user-attributes Name=email,Value="$LOGIN_EMAIL" Name=email_verified,Value=true \
+      --temporary-password 'ChangeMe-123!' >/dev/null
+    ok "  user created (temporary password ChangeMe-123!)"
+    FIRST_USER_CREATED=true
+  else
+    ok "User pool already has users"
+  fi
+fi
+
+# ── Smoke test (throwaway VM) ─────────────────────────────────────────────────
+MVM_STATE="not launched"
+PROBE_FAILED=false
+if [ "$NO_SMOKE" = false ] && [ "$FRONTEND_ONLY" = false ]; then
+  if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "None" ]; then
+    err "No MicroVM image ARN in the stack outputs."
     exit 1
   fi
 
   EGRESS_FLAG=""
-  if [ -n "$NETWORK_CONNECTOR_ARN" ] && [ "$NETWORK_CONNECTOR_ARN" != "None" ]; then
-    EGRESS_FLAG="--egress-network-connectors [\"$NETWORK_CONNECTOR_ARN\"]"
-  fi
-  REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}"
+  [ -n "$NETWORK_CONNECTOR_ARN" ] && [ "$NETWORK_CONNECTOR_ARN" != "None" ] \
+    && EGRESS_FLAG="--egress-network-connectors [\"$NETWORK_CONNECTOR_ARN\"]"
 
-  log "Creating throwaway access point for smoke test..."
+  log "Launching a throwaway MicroVM for the smoke test..."
   SMOKE_AP=$(aws s3files create-access-point \
     --file-system-id "$S3_FILES_FS_ID" \
     --posix-user 'uid=1000,gid=1000' \
     --root-directory 'path=/users/_smoketest,creationPermissions={ownerUid=1000,ownerGid=1000,permissions=0755}' \
     --query 'accessPointId' --output text 2>/dev/null || echo "")
 
-  log "Launching smoke-test MicroVM..."
   RUN_OUT=$(aws lambda-microvms run-microvm \
     --image-identifier "$IMAGE_ID" \
     --execution-role-arn "$EXECUTION_ROLE" \
-    --idle-policy '{"maxIdleDurationSeconds":1800,"suspendedDurationSeconds":600,"autoResumeEnabled":true}' \
-    --maximum-duration-in-seconds 28800 \
-    --ingress-network-connectors "[\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
+    --idle-policy "{\"maxIdleDurationSeconds\":$IDLE_MAX_SECONDS,\"suspendedDurationSeconds\":$IDLE_SUSPEND_SECONDS,\"autoResumeEnabled\":true}" \
+    --maximum-duration-in-seconds "$MAX_LIFETIME_SECONDS" \
+    --ingress-network-connectors "[\"arn:aws:lambda:${AWS_REGION}:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:${AWS_REGION}:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
     $EGRESS_FLAG \
     ${SMOKE_AP:+--run-hook-payload "{\"accessPointId\":\"$SMOKE_AP\"}"} \
     --output json 2>&1)
@@ -263,66 +323,60 @@ if [ "$SKIP_MVM" = false ]; then
   MVM_ENDPOINT=$(echo "$RUN_OUT" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
-ep = d.get('endpoint','')
+ep = d.get('endpoint', '')
 print(ep if ep.startswith('https://') else 'https://' + ep)
 " 2>/dev/null || echo "")
 
   if [ -z "$MVM_ID" ]; then
-    err "Failed to extract microvmId from run response"
+    err "Could not launch the smoke-test VM:"
     echo "$RUN_OUT" | tail -20 >&2
-    exit 1
-  fi
+  else
+    ok "Smoke VM: $MVM_ID"
+    sleep 15
 
-  ok "Smoke-test MicroVM launched: $MVM_ID"
-  ok "Endpoint: $MVM_ENDPOINT"
-  # Give snapshot boot + /run-hook mount a moment before probing
-  sleep 15
-  MVM_STATE="RUNNING"
-else
-  log "Skipping MVM smoke test (--skip-mvm)"
-  MVM_ID=""
-  MVM_ENDPOINT=""
-  MVM_STATE="not launched"
-fi
-
-# ── Smoke test + teardown of the throwaway VM ───────────────────────────────────
-if [ "$SKIP_MVM" = false ] && [ -n "$MVM_ID" ]; then
-  log "Smoke-testing ttyd (port 8080)..."
-  SMOKE_TOKEN=$(aws lambda-microvms create-microvm-auth-token \
-    --microvm-identifier "$MVM_ID" \
-    --expiration-in-minutes 5 \
-    --allowed-ports '[{"port":8080}]' \
-    --query 'authToken."X-aws-proxy-auth"' --output text 2>/dev/null || echo "")
-
-  if [ -n "$SMOKE_TOKEN" ] && [ -n "$MVM_ENDPOINT" ]; then
-    HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-      -H "X-aws-proxy-auth: $SMOKE_TOKEN" \
-      --max-time 15 \
-      "$MVM_ENDPOINT/" 2>/dev/null || echo "000")
-    if [[ "$HTTP_STATUS" =~ ^[23] ]]; then
-      ok "ttyd responding (HTTP $HTTP_STATUS)"
-    else
-      log "ttyd returned HTTP $HTTP_STATUS — may still be warming up"
+    log "Probing the VM (S3 Files mount + internet)..."
+    SHELL_TOKEN=$(aws lambda-microvms create-microvm-shell-auth-token \
+      --microvm-identifier "$MVM_ID" --expiration-in-minutes 10 \
+      --query 'authToken."X-aws-proxy-auth"' --output text 2>/dev/null || echo "")
+    if [ -n "$SHELL_TOKEN" ] && [ -n "$MVM_ENDPOINT" ]; then
+      if node "$ROOT_DIR/tools/smoke-probe.js" "$MVM_ENDPOINT" "$SHELL_TOKEN"; then
+        ok "VM probe passed"
+      else
+        err "VM probe FAILED — the stack is up but the VM cannot do useful work"
+        PROBE_FAILED=true
+      fi
     fi
-  fi
 
-  # Tear down the throwaway smoke-test VM + access point — real per-user VMs
-  # are launched by the token Lambda at login.
-  log "Tearing down smoke-test VM..."
-  aws lambda-microvms terminate-microvm --microvm-identifier "$MVM_ID" 2>/dev/null || true
-  if [ -n "$SMOKE_AP" ] && [ "$SMOKE_AP" != "None" ]; then
-    aws s3files delete-access-point --access-point-id "$SMOKE_AP" 2>/dev/null || true
+    log "Tearing down the smoke VM..."
+    aws lambda-microvms terminate-microvm --microvm-identifier "$MVM_ID" >/dev/null 2>&1 || true
+    [ -n "$SMOKE_AP" ] && [ "$SMOKE_AP" != "None" ] \
+      && aws s3files delete-access-point --access-point-id "$SMOKE_AP" >/dev/null 2>&1 || true
+    MVM_STATE="smoke-tested + torn down"
   fi
-  MVM_STATE="smoke-tested + torn down"
+elif [ "$NO_SMOKE" = true ]; then
+  MVM_STATE="skipped (--no-smoke)"
 fi
 
-# ── Done ──────────────────────────────────────────────────────────────────────
-# Deliberately short: TokenApiUrl, FrontendUrl, UserPoolId, LoginEmail, and
-# CreateUserCommand were all already printed by `sam deploy` itself above —
-# this only reports what THIS script uniquely did (the smoke test).
+# ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Remote Developer (rDev) — Deployed Successfully"
+if [ "$PROBE_FAILED" = true ]; then
+  echo "  Bivack — deployed with failures"
+else
+  echo "  Bivack — deployed"
+fi
+echo "  URL:        $FRONTEND_URL"
+[ -n "$LOGIN_EMAIL" ] && echo "  Login:      $LOGIN_EMAIL (temporary password ChangeMe-123! on first sign-in)"
 echo "  Smoke test: $MVM_STATE"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
+if [ "$FIRST_USER_CREATED" = true ]; then
+  echo "First sign-in: open the URL, sign in as $LOGIN_EMAIL with the temporary"
+  echo "password ChangeMe-123!, and set a new password when prompted."
+else
+  echo "Create or reset a login with:"
+  echo "  $CREATE_USER_CMD"
+fi
+echo ""
+[ "$PROBE_FAILED" = true ] && exit 1
+exit 0
