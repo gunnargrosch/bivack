@@ -1,7 +1,11 @@
+# OPTIONAL. scripts/deploy.sh passes the stack name, region, profile and
+# parameters explicitly and does not read this file. Keep a samconfig.toml only
+# if you want to run `sam build` / `sam deploy` by hand; deploy.env (see
+# deploy.env.example) is the config for the scripts.
 version = 0.1
 
 [default.global.parameters]
-stack_name = "ipad-claude"
+stack_name = "bivack"
 
 [default.build.parameters]
 cached = true

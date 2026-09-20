@@ -3,6 +3,9 @@ const https = require('https');
 const crypto = require('crypto');
 
 const ssm = new SSMClient({ region: process.env.AWS_REGION });
+// Per-stack SSM namespace. The stack name keeps two deployments in one region
+// from colliding; the literal fallback matches the default stack name.
+const SSM_PREFIX = process.env.SSM_PREFIX || '/bivack';
 
 async function getParam(name, decrypt = false) {
   const r = await ssm.send(new GetParameterCommand({ Name: name, WithDecryption: decrypt }));
@@ -74,7 +77,7 @@ const s3filesHost = () => `s3files.${region()}.api.aws`;
 // Idempotent: the access-point id is cached in SSM per user after first login.
 async function ensureUserAccessPoint(sub) {
   const fsId = process.env.S3_FILES_FS_ID;
-  const cacheParam = `/ipad-claude/users/${sub}/access-point-id`;
+  const cacheParam = `${SSM_PREFIX}/users/${sub}/access-point-id`;
 
   try {
     const cached = await getParam(cacheParam);
@@ -122,25 +125,26 @@ async function runNewMvm(accessPointId) {
   const body = {
     imageIdentifier: imageArn,
     executionRoleArn,
-    // Idle = no INBOUND proxy traffic. Outbound work (Claude calling Bedrock)
-    // does not reset the clock, so a closed tab means the countdown is running
+    // Idle = no INBOUND proxy traffic. Outbound work (Claude calling the model
+    // provider) does not reset the clock, so a closed tab means the countdown is running
     // even while a job grinds. 2h keeps kicked-off jobs alive tab-less;
     // maximumDurationInSeconds (8h) is the hard cap either way.
     idlePolicy: {
-      maxIdleDurationSeconds: 7200,
-      suspendedDurationSeconds: 1800,
+      maxIdleDurationSeconds: Number(process.env.IDLE_MAX_SECONDS) || 7200,
+      suspendedDurationSeconds: Number(process.env.IDLE_SUSPEND_SECONDS) || 1800,
       autoResumeEnabled: true,
     },
-    maximumDurationInSeconds: 28800,
+    maximumDurationInSeconds: Number(process.env.MAX_LIFETIME_SECONDS) || 28800,
     ingressNetworkConnectors: [
       `arn:aws:lambda:${region()}:aws:network-connector:aws-network-connector:HTTP_INGRESS`,
       `arn:aws:lambda:${region()}:aws:network-connector:aws-network-connector:SHELL_INGRESS`,
     ],
     ...(networkConnectorArn ? { egressNetworkConnectors: [networkConnectorArn] } : {}),
-    // Per-VM data delivered as the body of the /run hook. The hook writes the
-    // access-point id to a file that entrypoint.sh reads to mount this user's
-    // home directory (see microvm/hooks.js + entrypoint.sh).
-    ...(accessPointId ? { runHookPayload: JSON.stringify({ accessPointId }) } : {}),
+    // Per-VM data delivered as the body of the /run hook: the access-point id
+    // for the S3 Files mount (see microvm/hooks.js).
+    ...(accessPointId ? {
+      runHookPayload: JSON.stringify({ accessPointId }),
+    } : {}),
   };
 
   const data = await sigv4Request('POST', mvmHost(), '/2025-09-09/microvms', body);
@@ -155,7 +159,7 @@ async function mintToken(mvmId) {
     'POST',
     mvmHost(),
     `/2025-09-09/microvms/${encodeURIComponent(mvmId)}/auth-token`,
-    { expirationInMinutes: 55, allowedPorts: [{ port: 8080 }] }
+    { expirationInMinutes: 55, allowedPorts: [{ port: 8080 }, { port: 8082 }] }
   );
   return data.authToken?.['X-aws-proxy-auth'] || data.authToken;
 }
@@ -186,8 +190,8 @@ exports.handler = async (event) => {
   }
 
   // Per-user SSM keys — each user has their own MicroVM + home.
-  const mvmIdParam = `/ipad-claude/users/${sub}/mvm-identifier`;
-  const mvmEndpointParam = `/ipad-claude/users/${sub}/mvm-endpoint`;
+  const mvmIdParam = `${SSM_PREFIX}/users/${sub}/mvm-identifier`;
+  const mvmEndpointParam = `${SSM_PREFIX}/users/${sub}/mvm-endpoint`;
 
   // ── DELETE /token: terminate THIS user's VM ───────────────────────────────
   // The VM id comes from the caller's own SSM parameter (keyed by their

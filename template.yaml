@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Remote Developer — browser terminal running Claude Code and Codex in per-user
-  AWS Lambda MicroVMs, with Cognito auth and per-user S3 Files home directories.
+  Bivack — browser terminal running coding agents in per-user AWS Lambda
+  MicroVMs, with Cognito auth and per-user S3 Files home directories.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Layout of this template:
@@ -22,34 +22,87 @@ Description: >
 # ─────────────────────────────────────────────────────────────────────────────
 
 Parameters:
-  # Two categories only: values genuinely unknowable until deploy time
-  # (MicrovmCodeUri, WebSearchGatewayUrl — deploy.sh computes/discovers these
-  # itself every run), and personalization knobs meant to be set once via
-  # `sam deploy --guided` or samconfig.toml's parameter_overrides, not by
-  # deploy.sh (LoginEmail). Everything else that's a fixed, non-personal
-  # choice (image name, memory tier, capabilities, base image version) is a
-  # literal directly on the MicrovmImage resource below — not a Parameter.
+  # Two parameters. MicrovmCodeUri is computed by deploy.sh from the microvm/
+  # source on every run. LoginEmail is the first-login and budget-alert address,
+  # set in deploy.env and passed by deploy.sh. Everything else that is a fixed
+  # choice (image name, memory tier, capabilities, base image) is a literal on
+  # the MicrovmImage resource below, not a parameter.
   LoginEmail:
     Type: String
     Default: you@example.com
     Description: >-
-      Email for the admin-create-user command in this stack's Outputs.
-      Cosmetic — set your own once via `sam deploy --guided` or
-      samconfig.toml's parameter_overrides; CloudFormation retains it on
-      every later deploy.sh run without deploy.sh ever passing it.
+      Email for the first Cognito login and the monthly budget alerts. Set it
+      in deploy.env; deploy.sh passes it on every deploy.
   MicrovmCodeUri:
     Type: String
+    Default: ""
     Description: >-
       s3://bucket/key of the zipped microvm/ source. deploy.sh computes this
       from a content hash of the zip on every deploy — CloudFormation only
       diffs property VALUES, and unlike AWS::Serverless::Function this
       resource is NOT in SAM's local-file auto-upload list, so a content
       hash in the key is what makes a real code change actually trigger a
-      rebuild instead of silently no-op'ing against a stale key.
-  WebSearchGatewayUrl:
+      rebuild instead of silently no-op'ing against a stale key. Empty only
+      during the one-time bootstrap (DeployMicrovmImage=false).
+  DeployMicrovmImage:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Whether to create the MicroVM image. Set "false" only for the first-ever
+      deploy of a brand-new stack, which has no image artifact to pass as
+      MicrovmCodeUri yet. deploy.sh always passes "true".
+
+  # Runtime knobs. Defaults live here; set them in deploy.env and deploy.sh
+  # passes them on every deploy.
+  MicrovmMemoryMiB:
+    Type: Number
+    Default: 4096
+    AllowedValues: [512, 1024, 2048, 4096, 8192]
+    Description: "MicroVM memory tier (baseline MiB; bursts to 4x). From deploy.env."
+  IdleMaxSeconds:
+    Type: Number
+    Default: 7200
+    Description: "Seconds without inbound traffic before a VM suspends. From deploy.env."
+  IdleSuspendSeconds:
+    Type: Number
+    Default: 1800
+    Description: "Seconds a suspended VM stays resumable before it terminates."
+  MaxLifetimeSeconds:
+    Type: Number
+    Default: 28800
+    Description: "Hard maximum VM lifetime in seconds."
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 25
+    Description: "Monthly cost budget in USD; alerts at 80% and 100%."
+  BudgetEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Create the monthly cost budget. Set "false" in an Organization that blocks
+      budgets or handles cost alerts centrally.
+  BudgetEmail:
     Type: String
     Default: ""
-    Description: AgentCore web-search MCP endpoint (created out-of-band by deploy.sh; see WebSearchGatewayRole below).
+    Description: "Budget alert recipient. Empty falls back to LoginEmail."
+
+  NatMode:
+    Type: String
+    Default: instance
+    AllowedValues: [instance, gateway]
+    Description: >-
+      Outbound NAT for the private subnets. "instance" is a t4g.nano doing
+      masquerade (~$3/month); "gateway" is a managed NAT Gateway (~$33/month).
+      Set in deploy.env.
+
+Conditions:
+  DeployImage: !Equals [!Ref DeployMicrovmImage, "true"]
+  UseNatInstance: !Equals [!Ref NatMode, "instance"]
+  UseNatGateway: !Equals [!Ref NatMode, "gateway"]
+  CreateBudget: !Equals [!Ref BudgetEnabled, "true"]
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetEmail, ""]]
 
 Globals:
   Function:
@@ -67,7 +120,7 @@ Resources:
       CidrBlock: 10.0.0.0/16
       EnableDnsSupport: true
       EnableDnsHostnames: true
-      Tags: [{ Key: Name, Value: ipad-claude-vpc }]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-vpc" }]
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
@@ -129,14 +182,137 @@ Resources:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties: { RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnet2 }
 
-  NatEip:
+  # ── NAT instance (default) ───────────────────────────────────────────────────
+  # A t4g.nano doing ip_forward + masquerade is ~$3/month versus ~$33 for a NAT
+  # Gateway. It lives in a public subnet with an EIP, source/dest check off, and
+  # the private route table points at its ENI. Set NatMode=gateway for the
+  # managed NAT Gateway instead (see NatGateway below).
+  NatInstanceSecurityGroup:
+    Condition: UseNatInstance
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NAT instance - allow VPC-internal traffic
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: 10.0.0.0/16
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  NatInstanceRole:
+    Condition: UseNatInstance
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  NatInstanceProfile:
+    Condition: UseNatInstance
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref NatInstanceRole]
+
+  NatInstanceEni:
+    Condition: UseNatInstance
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      GroupSet: [!Ref NatInstanceSecurityGroup]
+      SourceDestCheck: false
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat-eni" }]
+
+  NatInstance:
+    Condition: UseNatInstance
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}"
+      InstanceType: t4g.nano
+      IamInstanceProfile: !Ref NatInstanceProfile
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref NatInstanceEni
+          DeviceIndex: "0"
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -x
+          # t4g.nano has 512 MB RAM and dnf can OOM mid-install; add swap first.
+          dd if=/dev/zero of=/swapfile bs=1M count=512 status=none || true
+          chmod 600 /swapfile || true
+          mkswap /swapfile >/dev/null 2>&1 || true
+          swapon /swapfile 2>/dev/null || true
+          sysctl -w net.ipv4.ip_forward=1
+          echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-nat.conf
+          dnf install -y iptables || true
+          # Keep the logic in a script file: inlining it in the unit's ExecStart
+          # mangles the awk quoting and IFACE ends up as the whole route line.
+          cat > /usr/local/bin/nat-setup.sh <<'EOS'
+          #!/bin/bash
+          set -e
+          IFACE=$(ip route show default | awk '{print $5}' | head -1)
+          echo "nat: iface=$IFACE"
+          iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+          EOS
+          chmod +x /usr/local/bin/nat-setup.sh
+          cat > /etc/systemd/system/nat.service <<'EOS'
+          [Unit]
+          Description=NAT masquerade
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/bin/nat-setup.sh
+          [Install]
+          WantedBy=multi-user.target
+          EOS
+          systemctl daemon-reload
+          systemctl enable --now nat.service
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat" }]
+
+  NatInstanceEip:
+    Condition: UseNatInstance
     Type: AWS::EC2::EIP
-    Properties: { Domain: vpc }
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref NatInstance
+
+  # Patch the NAT instance OS weekly. It is a managed SSM node (the role above
+  # grants AmazonSSMManagedInstanceCore), so this needs no SSH or inbound
+  # access. ApplyOnlyAtCronInterval keeps it from running at creation time.
+  NatInstancePatchAssociation:
+    Condition: UseNatInstance
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-RunPatchBaseline
+      AssociationName: !Sub "${AWS::StackName}-nat-patch"
+      Targets:
+        - Key: InstanceIds
+          Values: [!Ref NatInstance]
+      Parameters:
+        Operation: [Install]
+        RebootOption: [RebootIfNeeded]
+      ScheduleExpression: "cron(0 3 ? * SUN *)"
+      ApplyOnlyAtCronInterval: true
+
+  # ── NAT Gateway (alternative to the NAT instance) ────────────────────────────
+  NatGatewayEip:
+    Type: AWS::EC2::EIP
+    Condition: UseNatGateway
+    Properties:
+      Domain: vpc
 
   NatGateway:
     Type: AWS::EC2::NatGateway
+    Condition: UseNatGateway
     Properties:
-      AllocationId: !GetAtt NatEip.AllocationId
+      AllocationId: !GetAtt NatGatewayEip.AllocationId
       SubnetId: !Ref PublicSubnet1
 
   PrivateRouteTable:
@@ -149,7 +325,8 @@ Resources:
     Properties:
       RouteTableId: !Ref PrivateRouteTable
       DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NatGateway
+      NatGatewayId: !If [UseNatGateway, !Ref NatGateway, !Ref "AWS::NoValue"]
+      NetworkInterfaceId: !If [UseNatInstance, !Ref NatInstanceEni, !Ref "AWS::NoValue"]
 
   PrivateSubnet1RouteAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -170,6 +347,13 @@ Resources:
           FromPort: 2049
           ToPort: 2049
           CidrIp: 10.0.0.0/16
+      # Declare egress explicitly. Relying on the implicit default meant that
+      # any later template that set SecurityGroupEgress and then removed it
+      # left the group with NO egress rules (CloudFormation does not restore
+      # the default), which silently killed all outbound traffic from the VM.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
 
   # ── Storage ─────────────────────────────────────────────────────────────────
   # Workspace bucket backs the S3 Files filesystem (per-user home directories).
@@ -185,6 +369,15 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
       VersioningConfiguration: { Status: Enabled }
+      # Bound version growth: the CLIs churn files under the home, and every
+      # write or delete leaves a version or a delete marker behind.
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+            ExpiredObjectDeleteMarker: true
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
 
   ArtifactBucket:
     Type: AWS::S3::Bucket
@@ -197,6 +390,14 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
       VersioningConfiguration: { Status: Enabled }
+      # Build artifacts churn on each deploy; keep only recent versions.
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+            ExpiredObjectDeleteMarker: true
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
 
   FrontendBucket:
     Type: AWS::S3::Bucket
@@ -209,6 +410,9 @@ Resources:
 
   # Role S3 Files assumes to sync the bucket + manage its change-detection rules.
   # Inline: this is a service-linked-style trust policy with no policy-template equivalent.
+  # Object actions use the wildcards AWS documents (s3:GetObject*/PutObject*/...)
+  # rather than an enumerated list, because S3 Files calls versioned and tagging
+  # variants (s3:GetObjectVersionTagging, s3:PutObjectTagging, ...) during sync.
   S3FilesRole:
     Type: AWS::IAM::Role
     Properties:
@@ -233,13 +437,10 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:AbortMultipartUpload
-                  - s3:DeleteObject
-                  - s3:DeleteObjectVersion
-                  - s3:GetObject
-                  - s3:GetObjectVersion
+                  - s3:DeleteObject*
+                  - s3:GetObject*
                   - s3:List*
-                  - s3:PutObject
-                  - s3:PutObjectAcl
+                  - s3:PutObject*
                 Resource: !Sub "${WorkspaceBucket.Arn}/*"
                 Condition: { StringEquals: { aws:ResourceAccount: !Ref AWS::AccountId } }
               - Effect: Allow
@@ -251,12 +452,15 @@ Resources:
                 Resource: arn:aws:events:*:*:rule/*
 
   # S3 Files filesystem (NFS over the workspace bucket) + a mount target per AZ.
+  # ClientToken forces replacement when changed: bump the suffix if the filesystem
+  # ever needs recreating (e.g. a wedged synchronization state).
   S3FilesFileSystem:
     Type: AWS::S3Files::FileSystem
     Properties:
       Bucket: !GetAtt WorkspaceBucket.Arn
       RoleArn: !GetAtt S3FilesRole.Arn
       AcceptBucketWarning: true
+      ClientToken: !Sub "${AWS::StackName}-filesystem-v2"
 
   S3FilesMountTarget1:
     Type: AWS::S3Files::MountTarget
@@ -279,7 +483,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      UserPoolName: ipad-claude-users
+      UserPoolName: !Sub "${AWS::StackName}-users"
       AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
       UsernameAttributes: [email]
       AutoVerifiedAttributes: [email]
@@ -302,7 +506,7 @@ Resources:
     Type: AWS::Cognito::UserPoolClient
     Properties:
       UserPoolId: !Ref UserPool
-      ClientName: ipad-claude-web
+      ClientName: !Sub "${AWS::StackName}-web"
       GenerateSecret: false
       ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
       AccessTokenValidity: 1
@@ -336,53 +540,30 @@ Resources:
                 Action: s3:ListBucket
                 Resource: !GetAtt ArtifactBucket.Arn
 
-  # The MicroVM image itself. Was hand-rolled via aws lambda-microvms
-  # create-microvm-image/update-microvm-image in deploy.sh — moved here once
-  # AWS::Serverless::MicrovmImage shipped (June 2026), which maps 1:1 onto
-  # those CLI flags and, crucially, fixes the CLI's worst footgun: `update-
-  # microvm-image` REPLACED the whole version config on every call, silently
-  # resetting capabilities/hooks/env vars unless you re-passed all of them
-  # every time. As an ordinary CFN resource, the full property set is always
-  # declared, that class of bug can't happen, and CloudFormation's own async
-  # stabilization replaces our manual CREATING-poll loop.
+  # The MicroVM image itself, a first-class CloudFormation resource (the old
+  # hand-rolled `update-microvm-image` CLI path reset the whole version config
+  # on every call; as a resource the full property set is always declared).
   #
-  # BaseImageVersion and EgressNetworkConnectors below aren't arbitrary —
-  # they mirror what the CLI path was already resolving to by default
-  # (confirmed via get-microvm-image-version on the live image, which
-  # reported the resolved version as "1.0" — but this resource's input
-  # wants just the major version, "1"). Resources.MinimumMemoryInMiB is the
-  # one property deliberately NOT left at that old default: the CLI path
-  # never set it, so it silently floated at the platform default of 2048 MiB
-  # even though config.env.example used to carry an MVM_MEMORY=8192 that
-  # nothing ever actually consumed — the kind of dead, misleading config
-  # this migration is meant to make impossible. There is no config.env
-  # equivalent now; this literal IS the configuration.
-  #
-  # MinimumMemoryInMiB is a fixed-tier picker, not a free-form value —
-  # Lambda MicroVMs bill continuously at this baseline while running and
-  # auto-burst up to 4x it under load (billed per-second, only while
-  # actually bursting): 512→2048 peak, 1024→4096 peak, 2048→8192 peak,
-  # 4096→16384 peak, 8192→32768 peak. 4096 (4 GB baseline / 16 GB peak,
-  # 2 vCPU baseline / 8 vCPU peak) was chosen over the platform default of
-  # 2048 for headroom on sustained Claude Code / build workloads, without
-  # paying the 8192 tier's continuous rate for capacity mostly needed only
-  # in bursts. Change this literal directly to move tiers.
+  # MinimumMemoryInMiB is a fixed-tier picker, not a free-form value. A MicroVM
+  # bills at this baseline while running and bursts to 4x under load: 512 peaks
+  # at 2048, 1024 at 4096, 2048 at 8192, 4096 at 16384, 8192 at 32768. Set
+  # MicrovmMemoryMiB in deploy.env; 4096 is the default.
   MicrovmImage:
     Type: AWS::Serverless::MicrovmImage
+    Condition: DeployImage
     Properties:
-      Name: remote-dev
+      Name: !Sub "${AWS::StackName}"
       CodeUri: !Ref MicrovmCodeUri
       BuildRoleArn: !GetAtt MicroVmBuildRole.Arn
       BaseImageArn: !Sub "arn:aws:lambda:${AWS::Region}:aws:microvm-image:al2023-1"
       BaseImageVersion: "1"
       AdditionalOsCapabilities: [ALL]
       Resources:
-        - MinimumMemoryInMiB: 4096
+        - MinimumMemoryInMiB: !Ref MicrovmMemoryMiB
       EgressNetworkConnectors:
         - !Sub "arn:aws:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
       EnvironmentVariables:
         S3_FILES_FS_ID: !GetAtt S3FilesFileSystem.FileSystemId
-        WEBSEARCH_GATEWAY_URL: !Ref WebSearchGatewayUrl
       Hooks:
         Port: 9000
         MicrovmImageHooks:
@@ -400,75 +581,11 @@ Resources:
           Terminate: ENABLED
           TerminateTimeoutInSeconds: 10
 
-  # Permissions boundary for roles created FROM INSIDE the sandbox. The
-  # execution role may create/manage IAM roles only if the new role carries
-  # this boundary, and the boundary caps every such role at sandbox level —
-  # so the sandbox can deploy full stacks (SAM/CDK role creation included)
-  # but can never mint anything more privileged than itself, create IAM
-  # users/access keys, or tamper with the boundary. The statements here
-  # deliberately mirror the execution role's ScopedIamWrites policy so that
-  # roles created by created roles are capped identically (self-propagating).
-  # Name is fixed (not stack-derived) because the in-VM CLAUDE.md briefing
-  # must be able to state the ARN statically — repo convention, same as the
-  # hardcoded /ipad-claude/* SSM prefix and function name.
-  SandboxPermissionsBoundary:
-    Type: AWS::IAM::ManagedPolicy
-    Properties:
-      ManagedPolicyName: ipad-claude-sandbox-boundary
-      Description: Caps IAM roles created from inside the sandbox at sandbox privilege level.
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          # Broad service access, PowerUserAccess-shaped.
-          - Sid: Services
-            Effect: Allow
-            NotAction: [iam:*, organizations:*, account:*]
-            Resource: "*"
-          - Sid: IamRead
-            Effect: Allow
-            Action: [iam:Get*, iam:List*, iam:SimulatePrincipalPolicy, iam:SimulateCustomPolicy]
-            Resource: "*"
-          - Sid: PassRole
-            Effect: Allow
-            Action: iam:PassRole
-            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
-          - Sid: BoundedRoleWrites
-            Effect: Allow
-            Action: [iam:CreateRole, iam:PutRolePolicy, iam:DeleteRolePolicy, iam:AttachRolePolicy, iam:DetachRolePolicy, iam:PutRolePermissionsBoundary]
-            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
-            Condition:
-              StringEquals:
-                iam:PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/ipad-claude-sandbox-boundary"
-          - Sid: RoleLifecycle
-            Effect: Allow
-            Action: [iam:DeleteRole, iam:UpdateRole, iam:UpdateRoleDescription, iam:UpdateAssumeRolePolicy, iam:TagRole, iam:UntagRole, iam:CreateServiceLinkedRole]
-            Resource: "*"
-          - Sid: ManagePolicies
-            Effect: Allow
-            Action: [iam:CreatePolicy, iam:DeletePolicy, iam:CreatePolicyVersion, iam:DeletePolicyVersion, iam:SetDefaultPolicyVersion, iam:TagPolicy, iam:UntagPolicy]
-            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:policy/*"
-          - Sid: InstanceProfiles
-            Effect: Allow
-            Action: [iam:CreateInstanceProfile, iam:DeleteInstanceProfile, iam:AddRoleToInstanceProfile, iam:RemoveRoleFromInstanceProfile, iam:TagInstanceProfile, iam:UntagInstanceProfile]
-            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/*"
-          - Sid: DenyBoundaryTamper
-            Effect: Deny
-            Action: [iam:CreatePolicyVersion, iam:DeletePolicy, iam:DeletePolicyVersion, iam:SetDefaultPolicyVersion]
-            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:policy/ipad-claude-sandbox-boundary"
-          - Sid: DenyBoundaryRemoval
-            Effect: Deny
-            Action: iam:DeleteRolePermissionsBoundary
-            Resource: "*"
-          - Sid: DenyTouchSandboxInfra
-            Effect: Deny
-            Action: iam:*
-            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/ipad-claude-*"
-
-  # MicroVM execution role — the credential the sandbox operates with.
-  # AWS managed PowerUserAccess (full service access minus IAM/Orgs), plus
-  # inline Bedrock + S3 Files client-mount permissions, plus boundary-gated
-  # IAM writes (ScopedIamWrites) so `sam deploy` / CDK work from inside the
-  # sandbox without granting open-ended IAM. See README SECURITY.
+  # MicroVM execution role — what the platform assumes to boot the VM, and the
+  # identity the S3 Files kernel client uses via IMDS. Deliberately minimal: it
+  # can mount this user's home and look up its own endpoint, nothing more. The
+  # sandbox has no other AWS credentials, so IMDS is not a path to the account.
+  # See README SECURITY.
   MicroVmExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -479,108 +596,21 @@ Resources:
             Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
             Condition: { StringEquals: { aws:SourceAccount: !Ref AWS::AccountId } }
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/PowerUserAccess
       Policies:
-        - PolicyName: BedrockAndS3Files
+        - PolicyName: SandboxBaseline
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # The models are `us.anthropic.*` cross-region inference profiles.
-              # Invoking one needs BOTH the inference-profile ARN (in the deploy
-              # region) AND the underlying foundation-model ARNs in every region
-              # the US profile can route to (us-east-1 / us-east-2 / us-west-2).
-              # This is redundant while PowerUserAccess is attached, but makes the
-              # README's "scope PowerUserAccess down" advice actually safe.
-              - Effect: Allow
-                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
-                Resource:
-                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-*"
-                  - arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-*
-                  - arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-*
-                  - arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-*
-              # Codex 0.154 provides the current Bedrock picker: GPT-6 Astra
-              # and the GPT-5.6 Sol, Terra, and Luna family. Keep each active
-              # US inference profile and its regional foundation-model routes
-              # explicit so the grant remains useful if PowerUserAccess is
-              # replaced with least-privilege policies later.
-              - Effect: Allow
-                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
-                Resource:
-                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.openai.gpt-6-astra"
-                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.openai.gpt-5.6-*"
-                  - arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-6-astra
-                  - arn:aws:bedrock:us-east-2::foundation-model/openai.gpt-6-astra
-                  - arn:aws:bedrock:us-west-2::foundation-model/openai.gpt-6-astra
-                  - arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-5.6-*
-                  - arn:aws:bedrock:us-east-2::foundation-model/openai.gpt-5.6-*
-                  - arn:aws:bedrock:us-west-2::foundation-model/openai.gpt-5.6-*
+              # S3 Files kernel client mount. Data isolation comes from the
+              # per-user access point, not from IAM.
               - Effect: Allow
                 Action: [s3files:ClientMount, s3files:ClientWrite]
                 Resource: "*"
+              # Self endpoint lookup in hooks.js (best-effort; the endpoint is
+              # usually already in the run envelope).
               - Effect: Allow
-                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:DeleteObject, s3:ListBucket]
-                Resource: [!GetAtt WorkspaceBucket.Arn, !Sub "${WorkspaceBucket.Arn}/*"]
-              # Call the AgentCore web-search Gateway over MCP (SigV4 via the
-              # baked mcp-proxy-for-aws). The Gateway is created out-of-band by
-              # deploy.sh, so the ARN can't be referenced directly. This grant
-              # is scoped to all gateways in the account (a single gateway
-              # exists). Redundant while PowerUserAccess is attached — it
-              # already covers bedrock-agentcore — but explicit so the README's
-              # "scope PowerUserAccess down" advice stays safe.
-              - Effect: Allow
-                Action: bedrock-agentcore:InvokeGateway
-                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
-        # IAM writes for in-sandbox deploys (sam deploy, CDK, etc.), gated by
-        # the permissions boundary: any role created from the sandbox MUST
-        # carry SandboxPermissionsBoundary, which caps it at sandbox level and
-        # propagates the same cap to roles it creates in turn. Escalation
-        # paths are closed: no boundary-free role writes, no IAM users or
-        # access keys (never granted), no editing/removing the boundary, no
-        # touching the sandbox's own ipad-claude-* roles.
-        - PolicyName: ScopedIamWrites
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: IamRead
-                Effect: Allow
-                Action: [iam:Get*, iam:List*, iam:SimulatePrincipalPolicy, iam:SimulateCustomPolicy]
+                Action: lambda:GetMicrovm
                 Resource: "*"
-              - Sid: PassRole
-                Effect: Allow
-                Action: iam:PassRole
-                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
-              - Sid: BoundedRoleWrites
-                Effect: Allow
-                Action: [iam:CreateRole, iam:PutRolePolicy, iam:DeleteRolePolicy, iam:AttachRolePolicy, iam:DetachRolePolicy, iam:PutRolePermissionsBoundary]
-                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
-                Condition:
-                  StringEquals:
-                    iam:PermissionsBoundary: !Ref SandboxPermissionsBoundary
-              - Sid: RoleLifecycle
-                Effect: Allow
-                Action: [iam:DeleteRole, iam:UpdateRole, iam:UpdateRoleDescription, iam:UpdateAssumeRolePolicy, iam:TagRole, iam:UntagRole, iam:CreateServiceLinkedRole]
-                Resource: "*"
-              - Sid: ManagePolicies
-                Effect: Allow
-                Action: [iam:CreatePolicy, iam:DeletePolicy, iam:CreatePolicyVersion, iam:DeletePolicyVersion, iam:SetDefaultPolicyVersion, iam:TagPolicy, iam:UntagPolicy]
-                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:policy/*"
-              - Sid: InstanceProfiles
-                Effect: Allow
-                Action: [iam:CreateInstanceProfile, iam:DeleteInstanceProfile, iam:AddRoleToInstanceProfile, iam:RemoveRoleFromInstanceProfile, iam:TagInstanceProfile, iam:UntagInstanceProfile]
-                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/*"
-              - Sid: DenyBoundaryTamper
-                Effect: Deny
-                Action: [iam:CreatePolicyVersion, iam:DeletePolicy, iam:DeletePolicyVersion, iam:SetDefaultPolicyVersion]
-                Resource: !Ref SandboxPermissionsBoundary
-              - Sid: DenyBoundaryRemoval
-                Effect: Deny
-                Action: iam:DeleteRolePermissionsBoundary
-                Resource: "*"
-              - Sid: DenyTouchSandboxInfra
-                Effect: Deny
-                Action: iam:*
-                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/ipad-claude-*"
 
   # ── Compute: token-vending Lambda + API ──────────────────────────────────────
   TokenApi:
@@ -603,26 +633,29 @@ Resources:
   TokenFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: ipad-claude-token-vend
+      FunctionName: !Sub "${AWS::StackName}-token-vend"
       CodeUri: functions/token-vend/
       Handler: index.handler
       Environment:
         Variables:
           ALLOWED_ORIGINS: "*"
-          IMAGE_ARN: !GetAtt MicrovmImage.ImageArn
+          IMAGE_ARN: !If [DeployImage, !GetAtt MicrovmImage.ImageArn, ""]
           EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
           NETWORK_CONNECTOR_ARN: !GetAtt VpcEgressConnector.Arn
           S3_FILES_FS_ID: !GetAtt S3FilesFileSystem.FileSystemId
-          WORKSPACE_BUCKET_ARN: !GetAtt WorkspaceBucket.Arn
+          SSM_PREFIX: !Sub "/${AWS::StackName}"
+          IDLE_MAX_SECONDS: !Ref IdleMaxSeconds
+          IDLE_SUSPEND_SECONDS: !Ref IdleSuspendSeconds
+          MAX_LIFETIME_SECONDS: !Ref MaxLifetimeSeconds
       Policies:
         # SAM policy templates first:
-        - SSMParameterWithSlashPrefixReadPolicy: { ParameterName: /ipad-claude/* }
+        - SSMParameterWithSlashPrefixReadPolicy: { ParameterName: !Sub "/${AWS::StackName}/*" }
         # Then inline for permissions with no policy-template equivalent:
         - Statement:
             - Sid: SsmWritePerUserState
               Effect: Allow
-              Action: [ssm:PutParameter, ssm:GetParameter]
-              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ipad-claude/*"
+              Action: [ssm:PutParameter, ssm:GetParameter, ssm:DeleteParameter]
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*"
             - Sid: PerUserAccessPoints
               Effect: Allow
               Action: [s3files:CreateAccessPoint, s3files:GetAccessPoint, s3files:ListAccessPoints, s3files:DeleteAccessPoint]
@@ -650,6 +683,25 @@ Resources:
             Path: /token
             Method: delete
 
+  # Append index.html to directory requests so /ide/ and /cli/ work without the
+  # filename (CloudFront's DefaultRootObject only covers "/").
+  DirIndexFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${AWS::StackName}-dir-index"
+      AutoPublish: true
+      FunctionConfig:
+        Runtime: cloudfront-js-2.0
+        Comment: Append index.html to directory requests
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          if (request.uri.endsWith('/')) {
+            request.uri += 'index.html';
+          }
+          return request;
+        }
+
   # ── Frontend: S3 + CloudFront ─────────────────────────────────────────────────
   FrontendOac:
     Type: AWS::CloudFront::OriginAccessControl
@@ -664,7 +716,7 @@ Resources:
     Type: AWS::CloudFront::Distribution
     Properties:
       DistributionConfig:
-        Comment: Remote Developer (rDev) frontend
+        Comment: Bivack frontend
         Enabled: true
         DefaultRootObject: index.html
         Origins:
@@ -676,8 +728,21 @@ Resources:
           TargetOriginId: frontend-s3
           ViewerProtocolPolicy: redirect-to-https
           AllowedMethods: [GET, HEAD, OPTIONS]
+          # Compress text assets (the IDE bundle is ~12 MB uncompressed).
+          Compress: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt DirIndexFunction.FunctionARN
           # Managed-CachingDisabled — the frontend injects live config, don't cache it.
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+        CacheBehaviors:
+          # Hashed IDE assets are immutable; cache them hard (Managed-CachingOptimized).
+          - PathPattern: "ide/assets*"
+            TargetOriginId: frontend-s3
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
         CustomErrorResponses:
           - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html }
           - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html }
@@ -729,7 +794,7 @@ Resources:
   VpcEgressConnector:
     Type: AWS::Lambda::NetworkConnector
     Properties:
-      Name: ipad-claude-vpc-egress
+      Name: !Sub "${AWS::StackName}-vpc-egress"
       Configuration:
         VpcEgressConfiguration:
           SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
@@ -738,39 +803,38 @@ Resources:
           AssociatedComputeResourceTypes: [MicroVm]
       OperatorRole: !GetAtt NetworkConnectorOperatorRole.Arn
 
-  # ── Web search: AgentCore Gateway service role ─────────────────────────────────
-  # Native WebSearch/WebFetch are unavailable on Bedrock, so the in-VM Claude
-  # gets a real web-search tool via AWS's managed web-search connector, exposed
-  # over MCP behind an AgentCore Gateway with AWS_IAM inbound auth. The MicroVM
-  # reaches it through the already-baked, pre-warmed `mcp-proxy-for-aws`
-  # (SigV4-signed with the execution role's creds from IMDS), so there are no
-  # API keys to manage and queries stay inside AWS.
-  #
-  # The Gateway + Target themselves are created out-of-band by deploy.sh (the
-  # CFN resource handler has a serialization bug with the connector's empty
-  # ParameterValues map that causes CREATE_FAILED). This role is the outbound
-  # credential the Gateway uses to call the web-search tool.
-  WebSearchGatewayRole:
-    Type: AWS::IAM::Role
+  # ── Billing: monthly cost budget ─────────────────────────────────────────────
+  # Alerts the configured admin email at 80% and 100% of the expected monthly
+  # spend. The main cost drivers are MicroVM compute while running and the NAT
+  # instance; the first email subscriber must confirm the subscription.
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: CreateBudget
     Properties:
-      RoleName: !Sub "${AWS::StackName}-websearch-gw-role"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: bedrock-agentcore.amazonaws.com }
-            Action: sts:AssumeRole
-            Condition:
-              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
-      Policies:
-        - PolicyName: InvokeWebSearchConnector
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              # The tool ARN is AWS-owned (account = aws) and lives in us-east-1.
-              - Effect: Allow
-                Action: bedrock-agentcore:InvokeWebSearch
-                Resource: arn:aws:bedrock-agentcore:us-east-1:aws:tool/web-search.v1
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !If [HasBudgetEmail, !Ref BudgetEmail, !Ref LoginEmail]
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !If [HasBudgetEmail, !Ref BudgetEmail, !Ref LoginEmail]
 
 Outputs:
   TokenApiUrl:
@@ -781,12 +845,12 @@ Outputs:
   UserPoolClientId:
     Value: !Ref UserPoolClient
   LoginEmail:
-    Description: Configured via the LoginEmail parameter (samconfig.toml or --parameter-overrides).
+    Description: The first-login and budget-alert address (LOGIN_EMAIL in deploy.env).
     Value: !Ref LoginEmail
   CreateUserCommand:
     Description: >-
-      Run this once to create your first login. sam deploy prints this
-      automatically — no need for deploy.sh to reconstruct it.
+      Fallback for creating a login by hand. deploy.sh creates the first user
+      automatically; use this only to add or reset a user later.
     Value: !Sub "aws cognito-idp admin-create-user --user-pool-id ${UserPool} --username ${LoginEmail} --user-attributes Name=email,Value=${LoginEmail} Name=email_verified,Value=true --temporary-password 'ChangeMe-123!'"
   FrontendUrl:
     Value: !Sub "https://${FrontendDistribution.DomainName}"
@@ -798,17 +862,13 @@ Outputs:
     Value: !Ref WorkspaceBucket
   CloudFrontDistributionId:
     Value: !Ref FrontendDistribution
-  BuildRoleArn:
-    Value: !GetAtt MicroVmBuildRole.Arn
   ExecutionRoleArn:
     Value: !GetAtt MicroVmExecutionRole.Arn
   NetworkConnectorArn:
     Value: !GetAtt VpcEgressConnector.Arn
   S3FilesFileSystemId:
     Value: !GetAtt S3FilesFileSystem.FileSystemId
-  WebSearchGatewayRoleArn:
-    Description: IAM role used by the AgentCore web-search gateway (outbound connector auth).
-    Value: !GetAtt WebSearchGatewayRole.Arn
   MicrovmImageArn:
+    Condition: DeployImage
     Description: ARN of the MicroVM image (created/updated as part of this stack).
     Value: !GetAtt MicrovmImage.ImageArn
