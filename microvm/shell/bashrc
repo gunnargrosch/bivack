@@ -1,0 +1,7 @@
+# Shared environment lives on the image so image updates apply without
+# reseeding the home. See /opt/app/shell-env.sh.
+[ -r /opt/app/shell-env.sh ] && . /opt/app/shell-env.sh
+
+export PS1='\[\033[1;32m\]coder@bivack\[\033[0m\]:\[\033[1;34m\]\w\[\033[0m\]\$ '
+
+cd /home/coder

@@ -1,0 +1,14 @@
+# Shared environment lives on the image so image updates apply without
+# reseeding the home. See /opt/app/shell-env.sh.
+[ -r /opt/app/shell-env.sh ] && . /opt/app/shell-env.sh
+
+# Prompt: green coder@bivack : blue cwd $
+PROMPT='%F{green}coder@bivack%f:%F{blue}%~%f$ '
+
+# History on the persistent home
+export HISTFILE=/home/coder/.zsh_history
+export HISTSIZE=10000
+export SAVEHIST=10000
+setopt SHARE_HISTORY INC_APPEND_HISTORY
+
+cd /home/coder

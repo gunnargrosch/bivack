@@ -53,56 +53,45 @@ for attempt in 1 2 3 4 5 6; do
     fi
     # The environment briefing is image-owned, not user-owned: refresh it on
     # EVERY mount (not just first seed) so image updates reach existing homes.
-    if [ -f "$SKEL/.claude/CLAUDE.md" ]; then
-      mkdir -p "$MOUNT_PATH/.claude" 2>>/tmp/hooks.log || true
-      cp "$SKEL/.claude/CLAUDE.md" "$MOUNT_PATH/.claude/CLAUDE.md" 2>>/tmp/hooks.log \
-        && chown 1000:1000 "$MOUNT_PATH/.claude/CLAUDE.md" 2>>/tmp/hooks.log \
-        || echo "mount-home: CLAUDE.md refresh failed" >> /tmp/hooks.log
-    fi
+    # One shared file feeds all four agents; the image seeds it to each agent's
+    # expected path.
+    for rel in .claude/CLAUDE.md .codex/AGENTS.md .kiro/steering/microvm.md .config/opencode/AGENTS.md; do
+      [ -f "$SKEL/$rel" ] || continue
+      mkdir -p "$MOUNT_PATH/$(dirname "$rel")" 2>>/tmp/hooks.log || true
+      cp "$SKEL/$rel" "$MOUNT_PATH/$rel" 2>>/tmp/hooks.log \
+        && chown 1000:1000 "$MOUNT_PATH/$rel" 2>>/tmp/hooks.log \
+        || echo "mount-home: $rel refresh failed" >> /tmp/hooks.log
+    done
     # Persist the unattended Claude Code mode while preserving all other user
-    # settings, including plugins installed by the Agent Toolkit.
-    node /opt/app/claude-settings-config.js "$MOUNT_PATH/.claude/settings.json" >> /tmp/hooks.log 2>&1 \
+    # settings, including plugins.
+    node /opt/app/claude-settings.js "$MOUNT_PATH/.claude/settings.json" >> /tmp/hooks.log 2>&1 \
       && chown 1000:1000 "$MOUNT_PATH/.claude/settings.json" 2>>/tmp/hooks.log \
       || echo "mount-home: Claude permissions refresh failed" >> /tmp/hooks.log
-    # Codex and Kiro use their own documented instruction locations. Refresh
-    # only these image-owned artifacts, leaving all user configuration,
-    # projects, histories, and device-flow login state untouched.
-    if [ -f "$SKEL/.codex/AGENTS.md" ]; then
-      mkdir -p "$MOUNT_PATH/.codex" 2>>/tmp/hooks.log || true
-      cp "$SKEL/.codex/AGENTS.md" "$MOUNT_PATH/.codex/AGENTS.md" 2>>/tmp/hooks.log \
-        && chown 1000:1000 "$MOUNT_PATH/.codex/AGENTS.md" 2>>/tmp/hooks.log \
-        || echo "mount-home: Codex AGENTS.md refresh failed" >> /tmp/hooks.log
-    fi
-    if [ -f "$SKEL/.kiro/steering/microvm.md" ]; then
-      mkdir -p "$MOUNT_PATH/.kiro/steering" 2>>/tmp/hooks.log || true
-      cp "$SKEL/.kiro/steering/microvm.md" "$MOUNT_PATH/.kiro/steering/microvm.md" 2>>/tmp/hooks.log \
-        && chown 1000:1000 "$MOUNT_PATH/.kiro/steering/microvm.md" 2>>/tmp/hooks.log \
-        || echo "mount-home: Kiro steering refresh failed" >> /tmp/hooks.log
-    fi
     if [ -f "$SKEL/.kiro/settings/permissions.yaml" ]; then
       mkdir -p "$MOUNT_PATH/.kiro/settings" 2>>/tmp/hooks.log || true
       cp "$SKEL/.kiro/settings/permissions.yaml" "$MOUNT_PATH/.kiro/settings/permissions.yaml" 2>>/tmp/hooks.log \
         && chown 1000:1000 "$MOUNT_PATH/.kiro/settings/permissions.yaml" 2>>/tmp/hooks.log \
         || echo "mount-home: Kiro permissions refresh failed" >> /tmp/hooks.log
     fi
-    # Register/refresh the image-owned AgentCore web-search MCP server for all
-    # three CLIs. Each updater touches only its own named server entry and
-    # preserves the user's unrelated settings and servers.
-    if [ -n "${WEBSEARCH_GATEWAY_URL:-}" ]; then
-      node /opt/app/mcp-config.js "$MOUNT_PATH/.claude.json" "$WEBSEARCH_GATEWAY_URL" >> /tmp/hooks.log 2>&1 \
-        && chown 1000:1000 "$MOUNT_PATH/.claude.json" 2>>/tmp/hooks.log \
-        || echo "mount-home: Claude web-search MCP register failed" >> /tmp/hooks.log
-      mkdir -p "$MOUNT_PATH/.kiro/settings" 2>>/tmp/hooks.log || true
-      node /opt/app/mcp-config.js "$MOUNT_PATH/.kiro/settings/mcp.json" "$WEBSEARCH_GATEWAY_URL" "workspace-web-search" >> /tmp/hooks.log 2>&1 \
-        && chown 1000:1000 "$MOUNT_PATH/.kiro/settings/mcp.json" 2>>/tmp/hooks.log \
-        || echo "mount-home: Kiro web-search MCP register failed" >> /tmp/hooks.log
-      /opt/app/codex-mcp-config.sh "$MOUNT_PATH" "$WEBSEARCH_GATEWAY_URL" >> /tmp/hooks.log 2>&1 \
-        || echo "mount-home: Codex web-search MCP register failed" >> /tmp/hooks.log
-    fi
-    # The latest Agent Toolkit is user-scoped because it installs skills and
-    # agent configuration in this mounted home. Refresh asynchronously so a
-    # network update cannot delay terminal readiness.
-    nohup /opt/app/agent-toolkit-bootstrap.sh "$MOUNT_PATH" >> /tmp/hooks.log 2>&1 &
+    # The startup banner moved to terminal.js (image v11); strip the old copies
+    # from rc files seeded by earlier images so it does not print twice. Only
+    # the banner lines are removed; any user customization is left alone.
+    for rc in "$MOUNT_PATH/.zshrc" "$MOUNT_PATH/.bashrc"; do
+      [ -f "$rc" ] || continue
+      if grep -q "log in once, then /model to switch" "$rc" 2>/dev/null; then
+        sed -i \
+          -e "/Claude Code: 'claude' (log in once/d" \
+          -e "/Codex: 'codex' (log in once/d" \
+          -e "/OpenCode: 'opencode' (run \/connect/d" \
+          -e "/Kiro CLI: 'kiro-cli login' once/d" \
+          -e "/Workspace: \/home\/coder  (persistent S3 storage)/d" \
+          -e "/echo \"  VM: \$MICROVM_ID\"/d" \
+          "$rc" 2>>/tmp/hooks.log || true
+        chown 1000:1000 "$rc" 2>>/tmp/hooks.log || true
+        echo "mount-home: stripped legacy startup banner from $(basename "$rc")" >> /tmp/hooks.log
+      fi
+    done
+    # No web-search MCP wiring: every CLI provides native web search.
     MOUNTED=true
     break
   fi

@@ -22,6 +22,10 @@ set -e
 # (which the mount signals) before spawning the shell.
 node /opt/app/hooks.js > /tmp/hooks.log 2>&1 &
 
+# IDE file agent (port 8082), as coder so it can only touch the home. Reached
+# only through the authenticated ingress (see microvm/ide-agent.js).
+sudo -u coder HOME=/home/coder node /opt/app/ide-agent.js > /tmp/ide-agent.log 2>&1 &
+
 # Start terminal server — shell spawns lazily on first client resize, and only
 # after /tmp/home-ready appears (set by the mount running in the /run hook).
 exec node /opt/app/terminal.js

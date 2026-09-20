@@ -3,6 +3,7 @@ FROM public.ecr.aws/amazonlinux/amazonlinux:2023
 # curl-minimal is pre-installed — don't reinstall curl
 RUN dnf install -y \
     git \
+    openssh-clients \
     tar \
     gzip \
     unzip \
@@ -14,6 +15,16 @@ RUN dnf install -y \
     amazon-efs-utils \
     python3-pip \
     && dnf clean all
+
+# GitHub CLI. Agents use it for pull requests, issues, releases, and private
+# clones. `gh auth login` (device flow) stores its session under ~/.config/gh in
+# the persistent home, so it survives VM recycles like the other provider logins.
+# Must install BEFORE the python3.13 alternatives step below: that repoints
+# /usr/bin/python3, which breaks dnf (a python3.9 script) for later layers.
+RUN curl -fsSL https://cli.github.com/packages/rpm/gh-cli.repo -o /etc/yum.repos.d/gh-cli.repo \
+    && dnf install -y gh \
+    && dnf clean all \
+    && gh --version
 
 # Disable efs-utils/efs-proxy CloudWatch telemetry (mount attempts + proxy
 # metrics). It cannot work here anyway — mount.s3files runs under python3.13
@@ -41,46 +52,36 @@ RUN ARCH=$(uname -m) \
     && /tmp/aws/install \
     && rm -rf /tmp/awscliv2.zip /tmp/aws
 
-# Python 3.13 as the system interpreter. AL2023 ships 3.9, but the AWS agent
-# toolkit's secret-safety hook (and other tooling) needs >=3.10. uv picks its
-# own compatible Python for the MCP proxy at runtime; this is just a modern
-# system python3.
+# Python 3.13 as the system interpreter. AL2023 ships 3.9, and several tools
+# want >=3.10. uv installs its own Pythons on top of this when a tool needs one.
+# NOTE: the alternatives line below repoints /usr/bin/python3, which breaks dnf
+# (a python3.9 script) for every later layer. Any `dnf install` must run above.
 RUN dnf install -y python3.13 python3.13-pip \
     && dnf clean all \
     && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.13 90
 
 # uv/uvx on the SYSTEM filesystem (/opt), with all uv state pointed at /opt too.
-# WHY: the AWS agent toolkit plugin launches its MCP proxy via `uvx` (stock
-# config). uv relies on hardlinks for cache locking and package materialization,
-# and /home/coder is an NFS mount that rejects hardlinks (EMLINK) — so uvx fails
+# WHY: uv relies on hardlinks for cache locking and package materialization, and
+# /home/coder is an NFS mount that rejects hardlinks (EMLINK) — so uv/uvx fail
 # there no matter the link mode. /opt is a normal FS (hardlinks OK) and is baked
-# into the image snapshot, so relocating uv's cache/tool/python dirs to /opt lets
-# the plugin run EXACTLY as shipped — no patched .mcp.json, no re-patch hook.
-# The proxy package is pre-warmed into the cache so the first `uvx` is instant
-# and works offline.
+# into the image snapshot.
 ENV UV_INSTALL_DIR=/opt/uv/bin \
     UV_CACHE_DIR=/opt/uv/cache \
     UV_TOOL_DIR=/opt/uv/tool \
     UV_TOOL_BIN_DIR=/opt/uv/toolbin \
     UV_PYTHON_INSTALL_DIR=/opt/uv/python
-# Pre-warm the exact proxy packages used by the workspace MCP configuration.
-# `mcp-proxy-for-aws@latest` is the Agent Toolkit AWS MCP server; the pinned
-# 1.6.3 package fronts the AgentCore web-search gateway.
 RUN mkdir -p /opt/uv/bin /opt/uv/cache /opt/uv/tool /opt/uv/toolbin /opt/uv/python \
     && curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/opt/uv/bin sh \
     && ln -sf /opt/uv/bin/uv /usr/local/bin/uv \
     && ln -sf /opt/uv/bin/uvx /usr/local/bin/uvx \
-    && /opt/uv/bin/uvx mcp-proxy-for-aws@1.6.3 --help >/dev/null 2>&1 \
-    && /opt/uv/bin/uvx mcp-proxy-for-aws@latest --help >/dev/null 2>&1 \
     && chown -R 1000:1000 /opt/uv
 
-# Coding CLIs. Claude Code is globally installed; Codex is pinned under /opt so
-# the system-owned wrapper below can invoke a stable binary path. Each user's
-# configuration, history, and project state remain in their mounted S3 Files
-# home directory. Codex 0.154.0 adds GPT-6 Astra to both the Amazon Bedrock
-# catalog and interactive model picker.
-RUN npm install -g @anthropic-ai/claude-code \
-    && npm install --prefix /opt/codex --omit=dev @openai/codex@0.154.0 \
+# Coding CLIs. Claude Code and OpenCode are installed globally; Codex lives
+# under /opt so the system-owned wrapper below can invoke a stable binary path.
+# Each user's configuration, history, and login state sit in the mounted S3
+# Files home, so provider logins survive VM recycles.
+RUN npm install -g @anthropic-ai/claude-code opencode-ai \
+    && npm install --prefix /opt/codex --omit=dev @openai/codex@latest \
     && /opt/codex/node_modules/.bin/codex --version \
     && npm cache clean --force
 
@@ -102,16 +103,12 @@ RUN npm init -y && npm install node-pty ws && npm cache clean --force
 COPY hooks.js /opt/app/hooks.js
 COPY terminal.js /opt/app/terminal.js
 COPY mount-home.sh /opt/app/mount-home.sh
-COPY mcp-config.js /opt/app/mcp-config.js
-COPY claude-settings-config.js /opt/app/claude-settings-config.js
-COPY codex-mcp-config.sh /opt/app/codex-mcp-config.sh
-COPY agent-toolkit-bootstrap.sh /opt/app/agent-toolkit-bootstrap.sh
-COPY codex /usr/local/bin/codex
-COPY codex-astra /usr/local/bin/codex-astra
-COPY codex-grok /usr/local/bin/codex-grok
-COPY claude-model /usr/local/bin/claude-model
+COPY claude/settings.js /opt/app/claude-settings.js
+COPY ide-agent.js /opt/app/ide-agent.js
+COPY shell/env.sh /opt/app/shell-env.sh
+COPY codex/run.sh /usr/local/bin/codex
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /opt/app/codex-mcp-config.sh /opt/app/agent-toolkit-bootstrap.sh /usr/local/bin/codex /usr/local/bin/codex-astra /usr/local/bin/codex-grok /usr/local/bin/claude-model
+RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /usr/local/bin/codex
 
 # App user — NO -m flag: /home/coder must be empty so S3 Files can mount over it.
 # zsh is the login shell.
@@ -132,13 +129,17 @@ RUN [ -e /bin/bash ] || ln -s /usr/bin/bash /bin/bash; \
     true
 
 # Seed defaults — copied into /home/coder on first S3 mount (empty filesystem)
-RUN mkdir -p /etc/skel-coder/.claude/skills /etc/skel-coder/.codex /etc/skel-coder/.kiro/steering /etc/skel-coder/.kiro/settings
-COPY zshrc /etc/skel-coder/.zshrc
-COPY bashrc /etc/skel-coder/.bashrc
-COPY skills/ /etc/skel-coder/.claude/skills/
-COPY codex-briefing.md /etc/skel-coder/.codex/AGENTS.md
-COPY kiro-microvm.md /etc/skel-coder/.kiro/steering/microvm.md
-COPY kiro-permissions.yaml /etc/skel-coder/.kiro/settings/permissions.yaml
+RUN mkdir -p /etc/skel-coder/.claude /etc/skel-coder/.codex \
+    /etc/skel-coder/.kiro/steering /etc/skel-coder/.kiro/settings \
+    /etc/skel-coder/.config/opencode
+# One environment briefing, seeded to each agent's expected path.
+COPY agents/AGENTS.md /etc/skel-coder/.claude/CLAUDE.md
+COPY agents/AGENTS.md /etc/skel-coder/.codex/AGENTS.md
+COPY agents/AGENTS.md /etc/skel-coder/.kiro/steering/microvm.md
+COPY agents/AGENTS.md /etc/skel-coder/.config/opencode/AGENTS.md
+COPY shell/zshrc /etc/skel-coder/.zshrc
+COPY shell/bashrc /etc/skel-coder/.bashrc
+COPY kiro/permissions.yaml /etc/skel-coder/.kiro/settings/permissions.yaml
 
 RUN cat > /etc/skel-coder/.claude.json <<'EOF'
 {
@@ -157,112 +158,11 @@ RUN cat > /etc/skel-coder/.claude.json <<'EOF'
 }
 EOF
 
-RUN echo '{"permissions":{"defaultMode":"bypassPermissions"}}' \
-    > /etc/skel-coder/.claude/settings.json
-
-# Environment briefing for the in-VM Claude: where it runs, what persists, and
-# the local gotchas (NFS hardlinks, WebFetch, IAM scope, lifecycle). Refreshed
-# into /home/coder on every mount by mount-home.sh, not just first seed, so
-# updates reach existing users.
-RUN cat > /etc/skel-coder/.claude/CLAUDE.md <<'EOF'
-> **Do not edit this file — it is managed by the sandbox image and overwritten
-> on every workspace mount.** Put personal or project instructions in
-> `~/.claude/CLAUDE.local.md` or a `CLAUDE.md` inside your project directory;
-> those are yours and are never touched.
-
-# Your environment: a personal cloud sandbox VM
-
-You are running inside a dedicated AWS Lambda MicroVM (Firecracker-isolated,
-Amazon Linux 2023, aarch64, 8 GB RAM) that belongs entirely to this user and
-is reached through a browser terminal. Act accordingly: you have far more
-freedom here than in a typical local checkout, and different persistence rules.
-
-## What you can do freely
-- Full shell as `coder` with passwordless sudo. Installing packages (dnf, npm,
-  pip), running servers, compiling, long builds — all fine, no approval needed.
-- Outbound network from Bash is fully open (curl, git clone, package registries).
-- This VM is isolated per user: nothing you run here can affect other users.
-
-## What persists (and what does not)
-- ONLY `/home/coder` persists. It is an NFS mount backed by Amazon S3, scoped
-  to this user, and it survives VM restarts and recycles.
-- `npm install -g` persists: the npm prefix is `~/.npm-global` (on PATH), so
-  global npm installs land in home and survive recycles — no sudo needed.
-- `pip install` also persists: pip falls back to `--user` (`~/.local`, on
-  PATH) when system site-packages isn't writable.
-- Everything else — `sudo dnf install`, `uv tool install` (kept on /opt, see
-  below), system config — is on the VM image and resets when the VM is
-  recycled. If the user needs such a tool long-term, add the install command
-  to `~/.zshrc` so it self-heals on a fresh VM.
-- The home filesystem rejects hardlinks (EMLINK). Tools that depend on them
-  should keep caches/state outside home: uv is already configured for /opt/uv;
-  point similar tools at /tmp or /opt if they fail oddly in $HOME.
-
-## VM identity
-- `$MICROVM_ID` is this VM's id; `$MICROVM_ENDPOINT` is its public HTTPS
-  ingress URL (both also in /tmp/microvm-id and /tmp/microvm-endpoint).
-  The endpoint reaches port 8080 (the terminal) and requires a proxy auth
-  token — it is NOT a way to expose arbitrary services publicly.
-
-## Credentials and AWS access
-- There are no API keys anywhere. AWS access comes from the VM's IAM execution
-  role via IMDSv2. You (Claude Code) run through Amazon Bedrock using that role.
-- The role is broad by design: PowerUserAccess (full access to AWS services)
-  plus scoped IAM writes so you can deploy real stacks — `sam deploy`, CDK,
-  CloudFormation with role creation all work. The guardrail is a permissions
-  boundary: **any IAM role you create MUST carry the permissions boundary
-  `arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary`** (get the
-  account id from `aws sts get-caller-identity`), or the CreateRole call is
-  denied with AccessDenied. How to attach it:
-  - SAM: add to template.yaml — `Globals: { Function: { PermissionsBoundary:
-    arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary } }`, or
-    per-role via the role's `PermissionsBoundary` property.
-  - CDK: `new iam.Role(..., { permissionsBoundary: ManagedPolicy.fromManagedPolicyArn(...) })`
-    or the `@aws-cdk/core:permissionsBoundary` context key.
-  - CLI: `aws iam create-role --permissions-boundary <that-arn> ...`
-  If a deploy fails with AccessDenied on iam:CreateRole, the missing boundary
-  is almost always why — fix the template, don't retry blindly.
-- Hard limits (by design, do not try to work around them): no IAM users or
-  access keys, no editing/removing the boundary itself, no touching the
-  sandbox's own `ipad-claude-*` roles, and roles you create are capped at
-  this sandbox's own privilege level.
-- With great power: this role is shared across every user's VM and is billed
-  to the sandbox owner's account. Create resources deliberately, prefer
-  tagging what you create, and clean up experiments when done.
-
-## VM lifecycle — checkpoint long work
-- Idle is measured by INBOUND browser traffic only. If the user closes the tab,
-  the VM suspends after ~2 hours (your process freezes mid-instruction and
-  resumes later; in-flight network calls will have died — just retry). A VM
-  lives at most 8 hours, then terminates.
-- Therefore: for long-running jobs, write progress and results to files under
-  /home/coder as you go. Files survive termination; your session does not.
-
-## Web search and fetching
-- The native WebSearch and WebFetch tools are NOT available on Amazon Bedrock,
-  so they are off here. Instead you have a managed web search wired in over
-  MCP: the `web-search` tool (AWS AgentCore Web Search, backed by Amazon's own
-  index; queries stay inside AWS). Use it whenever you need current
-  information — it returns ranked snippets with source URLs and dates.
-- For fetching a specific page's contents, use curl via Bash, e.g.:
-  curl -s "https://example.com"  or  curl -s "wttr.in/London?format=3"
-- If the `web-search` MCP tool is ever unavailable (e.g. gateway not yet
-  deployed), fall back to curl against a search endpoint.
-EOF
-
-# Bedrock — uses execution role via IMDSv2
+# Home + AWS region. Model access uses the user's own provider logins persisted
+# under /home/coder.
 ENV HOME=/home/coder
 ENV S3_FILES_FS_ID=__S3_FILES_FS_ID__
-ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV AWS_REGION=us-east-1
-# Default model: Opus (Fable requires US data residency; users may be outside US).
-# Fable available via: /model us.anthropic.claude-fable-5-1
-ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-5
-ENV ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-5
-ENV ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5
-ENV ANTHROPIC_DEFAULT_HAIKU_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
-ENV ANTHROPIC_DEFAULT_FABLE_MODEL=us.anthropic.claude-fable-5-1
-ENV ANTHROPIC_SMALL_FAST_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 ENV DISABLE_AUTOUPDATER=1
 ENV DO_NOT_TRACK=1

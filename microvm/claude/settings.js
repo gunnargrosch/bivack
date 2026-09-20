@@ -19,4 +19,4 @@ config.permissions.defaultMode = 'bypassPermissions';
 
 fs.mkdirSync(path.dirname(configPath), { recursive: true });
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-console.log('claude-settings-config: bypassPermissions enabled');
+console.log('claude-settings: bypassPermissions enabled');

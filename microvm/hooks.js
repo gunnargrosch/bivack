@@ -15,8 +15,8 @@ const MVM_ID_FILE = '/tmp/microvm-id';
 const MVM_EP_FILE = '/tmp/microvm-endpoint';
 
 // The public endpoint isn't derivable from the VM id and may not be in the
-// /run envelope — ask the control plane about ourselves (execution role has
-// PowerUserAccess, so get-microvm is allowed). Background + best-effort.
+// /run envelope — ask the control plane about ourselves (the execution role
+// allows lambda:GetMicrovm). Background + best-effort.
 function lookupEndpoint(mvmId) {
   const region = process.env.AWS_REGION || 'us-east-1';
   const child = spawn('/bin/sh', ['-c',
@@ -42,33 +42,6 @@ function mountHome(accessPointId) {
     { detached: true, stdio: 'ignore' });
   child.unref();
   console.log(`mountHome launched (accesspoint=${accessPointId || 'none'})`);
-}
-
-// Pre-warm the uvx-launched AWS MCP proxy so the first Claude session's MCP
-// connect doesn't hit a cold uv cache and risk timing out. The version is
-// parsed from the plugin's own .mcp.json (the file that actually launches
-// it) so the warm can never drift from reality. The plugin cache lives in
-// the user home, so this waits for the mount's ready marker (60s cap so a
-// failed mount can't wedge it). No match (plugin not installed) → skip.
-let mcpWarmStarted = false;
-function warmMcpProxy() {
-  if (mcpWarmStarted) return;
-  mcpWarmStarted = true;
-  const waitStart = Date.now();
-  const iv = setInterval(() => {
-    if (!fs.existsSync('/tmp/home-ready') && Date.now() - waitStart < 60000) return;
-    clearInterval(iv);
-    const child = spawn('/bin/sh', ['-c',
-      'V=$(grep -ho "mcp-proxy-for-aws@[0-9.]*" /home/coder/.claude/plugins/cache/*/*/*/.mcp.json 2>/dev/null | head -1); ' +
-        '[ -n "$V" ] && sudo -u coder HOME=/home/coder ' +
-        'UV_CACHE_DIR=/opt/uv/cache UV_PYTHON_INSTALL_DIR=/opt/uv/python ' +
-        'UV_TOOL_DIR=/opt/uv/tool UV_TOOL_BIN_DIR=/opt/uv/toolbin ' +
-        'uvx "$V" --help >/dev/null 2>&1; ' +
-        'echo "mcp warm done" >> /tmp/hooks.log'
-    ], { detached: true, stdio: 'ignore' });
-    child.unref();
-    console.log('MCP proxy warm launched');
-  }, 250);
 }
 
 function unmountHome() {
@@ -121,21 +94,9 @@ const server = http.createServer((req, res) => {
         // belt-and-suspenders: read the big binaries end to end for sampling
         'cat /usr/sbin/efs-proxy /usr/bin/node /usr/bin/mount /usr/sbin/mount.nfs > /dev/null 2>&1 || true',
         '/usr/bin/python3.13 -c "import subprocess,ssl,json" || true',
-        // the uv cache holds the pre-warmed AWS MCP proxy package (Dockerfile);
-        // a session's first MCP connect launches it via uvx, so RUN the real
-        // command — paging uv's python, extraction, and env-assembly paths
-        // that a byte-level sweep of the cache files would miss. Version must
-        // match the Dockerfile pre-warm (no user home at validate time to
-        // parse the plugin config from).
-        'sudo -u coder HOME=/home/coder ' +
-          'UV_CACHE_DIR=/opt/uv/cache UV_PYTHON_INSTALL_DIR=/opt/uv/python ' +
-          'UV_TOOL_DIR=/opt/uv/tool UV_TOOL_BIN_DIR=/opt/uv/toolbin ' +
-          'timeout 60 uvx mcp-proxy-for-aws@1.6.3 --help >/dev/null 2>&1 || true',
-        'sudo -u coder HOME=/home/coder ' +
-          'UV_CACHE_DIR=/opt/uv/cache UV_PYTHON_INSTALL_DIR=/opt/uv/python ' +
-          'UV_TOOL_DIR=/opt/uv/tool UV_TOOL_BIN_DIR=/opt/uv/toolbin ' +
-          'timeout 60 uvx mcp-proxy-for-aws@latest --help >/dev/null 2>&1 || true',
-        'find /opt/uv -type f -exec cat {} + > /dev/null 2>&1 || true',
+        // uv is available in the image; sample its cold path too.
+        'sudo -u coder HOME=/home/coder /opt/uv/bin/uv --version || true',
+        'sudo -u coder HOME=/home/coder /opt/uv/bin/uvx --version || true',
         'touch /tmp/validate-done',
       ].join('; ')], { detached: true, stdio: 'ignore' });
       child.unref();
@@ -158,13 +119,7 @@ const server = http.createServer((req, res) => {
       // raw JSON, and base64 variants) so it's robust to shape changes.
       // The raw body is logged as a one-liner for future diagnosis.
       try { fs.appendFileSync('/tmp/hooks.log', `RAW ${url} BODY=[${(body||'').slice(0, 1000)}]\n`); } catch {}
-      let accessPointId = '';
-      const tryExtract = (s) => {
-        if (!s) return '';
-        // direct field
-        try { const o = JSON.parse(s); if (o && o.accessPointId) return String(o.accessPointId); } catch {}
-        return '';
-      };
+      let accessPointId = '', runPayload = null;
       try {
         const candidates = [];
         const raw = body || '';
@@ -181,8 +136,13 @@ const server = http.createServer((req, res) => {
           }
         } catch {}
         for (const c of candidates) {
-          const ap = tryExtract(c);
-          if (ap) { accessPointId = ap; break; }
+          try {
+            const o = JSON.parse(c);
+            if (o && typeof o === 'object' && o.accessPointId) { runPayload = o; break; }
+          } catch {}
+        }
+        if (runPayload && runPayload.accessPointId) {
+          accessPointId = String(runPayload.accessPointId);
         }
         if (accessPointId) fs.writeFileSync(AP_FILE, accessPointId);
         // The platform injects this VM's own id into the /run envelope as
@@ -207,7 +167,6 @@ const server = http.createServer((req, res) => {
       // Answer fast; the mount runs in the background (see mountHome).
       res.writeHead(200); res.end();
       mountHome(accessPointId);
-      if (url === `${BASE}/run`) warmMcpProxy();
     });
     return;
   }

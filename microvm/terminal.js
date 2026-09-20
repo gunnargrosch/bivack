@@ -23,18 +23,10 @@ const SHELL_ENV = {
   USER: 'coder',
   LOGNAME: 'coder',
   SHELL: '/usr/bin/zsh',
-  CLAUDE_CODE_USE_BEDROCK: '1',
   AWS_REGION: 'us-east-1',
-  // Current Claude family defaults. Use `claude-model` to select a family
-  // explicitly without changing a user's persisted Claude configuration.
-  ANTHROPIC_MODEL: 'us.anthropic.claude-opus-5',
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'us.anthropic.claude-opus-5',
-  ANTHROPIC_DEFAULT_SONNET_MODEL: 'us.anthropic.claude-sonnet-5',
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
-  ANTHROPIC_DEFAULT_FABLE_MODEL: 'us.anthropic.claude-fable-5-1',
-  ANTHROPIC_SMALL_FAST_MODEL: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
-  // uv/uvx state on the hardlink-capable system FS (NFS home rejects hardlinks),
-  // so the AWS toolkit's uvx-launched MCP proxy runs from the warmed /opt cache.
+  // Model access uses the user's own provider logins persisted under the home
+  // directory. uv/uvx state lives on the hardlink-capable system FS, since the
+  // NFS home rejects hardlinks.
   UV_CACHE_DIR: '/opt/uv/cache',
   UV_PYTHON_INSTALL_DIR: '/opt/uv/python',
   UV_TOOL_DIR: '/opt/uv/tool',
@@ -99,11 +91,32 @@ function broadcastEveryone(data) {
   }
 }
 
+// Terminal queries in the scrollback (OSC color, cursor position, device
+// attributes, and friends) make the emulator reply when they are replayed. The
+// reply goes to the pty and the shell echoes it at the prompt, which is the
+// garbled text seen after a reconnect. Strip the queries from the replay only;
+// they are control sequences with no visible output.
+const REPLAY_QUERY_PATTERNS = [
+  /\x1b\][^\x07\x1b]*\?(?:\x07|\x1b\\)/g, // OSC queries (colors, palette)
+  /\x1b\[(?:5|6)n/g, // device status / cursor position
+  /\x1b\[[?>]?[0-9;]*c/g, // device attributes
+  /\x1b\[>[0-9;]*[uq]/g, // cursor style / kitty keyboard flags
+  /\x1b\[[0-9;]*t/g, // window size / title queries
+  /\x1b\[\??[0-9;]*\$p/g, // DECRQM
+  /\x1bP\$q[^\x1b]*\x1b\\/g, // DECRQSS
+];
+function sanitizeReplay(data) {
+  let s = Buffer.isBuffer(data) ? data.toString('latin1') : String(data);
+  for (const re of REPLAY_QUERY_PATTERNS) s = s.replace(re, '');
+  return Buffer.from(s, 'latin1');
+}
+
 function replayScrollback(session, ws) {
   if (session.scrollback.length === 0) return;
-  const sm = Buffer.alloc(1 + session.scrollback.length);
+  const replay = sanitizeReplay(session.scrollback);
+  const sm = Buffer.alloc(1 + replay.length);
   sm[0] = 0x30;
-  session.scrollback.copy(sm, 1);
+  replay.copy(sm, 1);
   ws.send(sm);
 }
 
@@ -113,6 +126,25 @@ const HOME_READY = '/tmp/home-ready';
 // MOUNT_RETRIES * (MOUNT_TIMEOUT_MS + MOUNT_RETRY_DELAY_MS) = 6 * 35s = 210s max
 // Add a small buffer on top.
 const WAIT_TIMEOUT_MS = 240000;
+
+// Startup banner. Printed here (once, right after the mount) rather than from
+// the seedable rc files: a first-connect shell could read ~/.zshrc while the
+// home was still being seeded and show only part of it. One broadcast is atomic.
+const CLI_HINTS = [
+  "  Claude Code: 'claude' (log in once, then /model to switch)",
+  "  Codex: 'codex' (log in once, then /model to switch)",
+  "  OpenCode: 'opencode' (run /connect once to add a provider)",
+  "  Kiro CLI: 'kiro-cli login' once, then 'kiro-cli'",
+  '  Workspace: /home/coder  (persistent S3 storage)',
+];
+function cliBanner() {
+  let vm = '';
+  try { vm = fs.readFileSync('/tmp/microvm-id', 'utf8').trim(); } catch {}
+  const lines = ['', '  Your cloud dev sandbox for coding agents', '', ...CLI_HINTS];
+  if (vm) lines.push(`  VM: ${vm}`);
+  lines.push('');
+  return `\r\n${lines.join('\r\n')}\r\n`;
+}
 
 // Shared home-mount wait: the first session to need a shell drives the
 // animation; any others started meanwhile just queue their callbacks.
@@ -158,6 +190,7 @@ function waitForHome(cb) {
       } else {
         broadcastEveryone('\x1b[32m[Workspace mounted]\x1b[0m\r\n');
       }
+      broadcastEveryone(cliBanner());
       finish();
     } else if (elapsed >= WAIT_TIMEOUT_MS) {
       clearInterval(iv);
@@ -289,7 +322,7 @@ wss.on('connection', (ws) => {
         session = getSession(id);
 
         // Title frame
-        const title = 'rDev';
+        const title = 'Bivack';
         const tb = Buffer.alloc(1 + title.length);
         tb[0] = 0x31; tb.write(title, 1);
         ws.send(tb);
@@ -307,10 +340,6 @@ wss.on('connection', (ws) => {
           session.clients.add(ws);
         } else {
           session.pending.add(ws);
-          // Show mounting status if home isn't ready yet
-          if (!fs.existsSync(HOME_READY)) {
-            sendOutput(ws, '\r\n\x1b[36mMounting workspace…\x1b[0m\r\n');
-          }
         }
       } catch (e) {}
       return;
