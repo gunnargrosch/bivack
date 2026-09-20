@@ -1,568 +1,288 @@
-# Remote Developer (rDev)
+# Bivack
 
-A browser-based terminal — built for the iPad, works anywhere — that runs
-[Claude Code](https://www.anthropic.com/claude-code),
-[Codex CLI](https://developers.openai.com/codex/cli/), and
-[Kiro CLI](https://kiro.dev/docs/cli/setup.md) inside an **AWS Lambda
-MicroVM**, with a persistent home directory backed by **Amazon S3**. Open a URL,
-log in, and work with any of the three CLIs in a real shell. Claude Code and
-Codex run against Amazon Bedrock (no API keys); Kiro CLI is a separate hosted
-service each user signs into with their own account. Close the tab and come
-back later — your files, history, and each CLI's login state are still there.
+**Your cloud dev sandbox for coding agents.**
 
-> ⚠️ **This is a demo / small-team project, not a hardened product.** Auth is
-> Cognito (admin-created users, per-user MicroVMs), but the sandbox runs with a
-> broadly-privileged AWS role. Read the [Security](#security) section before
-> deploying anywhere sensitive.
+[![License: MIT-0](https://img.shields.io/badge/License-MIT--0-blue.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A520-green)](https://nodejs.org/)
+[![AWS SAM](https://img.shields.io/badge/AWS-SAM-orange)](https://aws.amazon.com/serverless/sam/)
+[![AWS Lambda MicroVMs](https://img.shields.io/badge/AWS-Lambda%20MicroVMs-FF9900)](https://aws.amazon.com/lambda/)
 
----
+Run [Claude Code](https://www.anthropic.com/claude-code), [Codex CLI](https://developers.openai.com/codex/cli/), [OpenCode](https://opencode.ai), and [Kiro CLI](https://kiro.dev/docs/cli/setup.md) in per-user **AWS Lambda MicroVMs**, each with a persistent **Amazon S3** home directory, reached from a browser terminal or a browser VS Code workbench.
 
-## How it works
+Each CLI uses the user's own provider login, so there are no shared API keys in the image. Close the tab and come back: files, history, and every login are still there.
 
-```mermaid
-flowchart TD
-    UI["Browser<br/>(xterm.js terminal)"]
+Bivack is built on [Remote Developer (rDev)](https://github.com/singledigit/microvm-dev-environment) by [Eric Johnson](https://github.com/singledigit); see [Credits](#credits).
 
-    CF["CloudFront"]
-    COG["Cognito<br/>(User Pool)"]
-    APIGW["API Gateway<br/>(Cognito Authorizer)"]
-    TOKENFN["Token Lambda<br/>(find/create home,<br/>launch/resume VM,<br/>mint auth token)"]
-    MVM["Per-User MicroVM<br/>(Claude Code, Codex, Kiro + zsh)"]
-    S3FILES[("S3 Files<br/>(/home/coder)<br/>per-user access point")]
-    ACGW["AgentCore Gateway<br/>(AWS_IAM inbound)"]
-    WEBSEARCH[("Web Search<br/>(Amazon-managed index)")]
+> A demo / small-team project, not a hardened product. Read [Security](#security) before deploying anywhere sensitive.
 
-    UI -->|HTTPS| CF
-    CF -.->|static frontend| UI
-    UI -->|sign in| COG
-    COG -.->|JWT| UI
-    UI -->|"GET /token (JWT in header)"| APIGW
-    APIGW -->|validated identity| TOKENFN
-    TOKENFN -.->|"{ authToken, endpoint }"| UI
-    UI -->|"WebSocket (wss)<br/>subprotocol auth"| MVM
-    MVM -->|"mount (lifecycle hook)"| S3FILES
-    MVM -->|"MCP over SigV4<br/>(mcp-proxy-for-aws)"| ACGW
-    ACGW -->|"managed connector"| WEBSEARCH
-```
+| Chooser | Terminal | VS Code workbench |
+| :-: | :-: | :-: |
+| [![Chooser](docs/bivack-chooser.png)](docs/bivack-chooser.png) | [![Terminal](docs/bivack-cli.png)](docs/bivack-cli.png) | [![VS Code workbench](docs/bivack-ide.png)](docs/bivack-ide.png) |
 
-- **Frontend** — a single `index.html` (xterm.js) on S3, served via CloudFront.
-  The user signs in against Cognito (via `amazon-cognito-identity-js`), gets a
-  JWT, then opens a WebSocket straight to their MicroVM's service-managed
-  endpoint, authenticating via the `lambda-microvms.*` subprotocols. On the wire
-  it speaks the ttyd binary protocol.
-- **Auth — Cognito + API Gateway.** A Cognito User Pool holds admin-created
-  users (no self-signup). **API Gateway's Cognito authorizer validates the JWT
-  before the token Lambda ever runs** — the Lambda never sees a password, only
-  the already-verified identity.
-- **Token Lambda** — reads the verified Cognito `sub` from the request context,
-  finds-or-creates that user's S3 Files access point (scoped to `/users/<sub>`),
-  launches or resumes **that user's own MicroVM**, and mints a short-lived auth
-  token. Hand-rolled SigV4, so it's immune to AWS CLI command-name churn.
-- **MicroVM image** — Amazon Linux 2023 + Node, Python 3.13, the AWS CLI, `uv`,
-  Claude Code, Codex CLI, and Kiro CLI. `terminal.js` is a WebSocket PTY server.
-  `claude` defaults to Opus 5, `claude-model` selects any current Claude family
-  model, and Codex uses Amazon Bedrock's current supported OpenAI catalog. The
-  image refreshes a managed MicroVM briefing for each CLI after the user's home
-  mount, without replacing CLI history, preferences, or Kiro login state.
-  The per-user home is mounted at run time by the `/run` lifecycle hook (which
-  receives the access-point id in its payload) — `mount -o accesspoint=<id>` —
-  so each user gets an isolated `/home/coder` that persists across restarts.
-- **Web search** — native WebSearch/WebFetch aren't available on Bedrock, so
-  each in-VM CLI gets managed web search through **Amazon Bedrock AgentCore**:
-  the `workspace-web-search` MCP server uses the managed `web-search` connector
-  behind an AgentCore Gateway (`AWS_IAM` inbound auth). The VM reaches it via
-  the already-baked `mcp-proxy-for-aws`, SigV4-signed with the execution role
-  from IMDS — no API keys, and queries stay inside AWS. `mount-home.sh` refreshes
-  only this image-owned MCP entry for Claude, Codex, and Kiro while preserving
-  their unrelated user configuration.
-- **SAM template** (`template.yaml`) — VPC + security group, the S3 buckets
-  (frontend / artifacts / workspace), the S3 Files filesystem + mount targets,
-  the Cognito pool + authorizer, IAM roles, the token Lambda + API Gateway,
-  CloudFront, a Lambda Network Connector for VPC egress to the S3 Files
-  mount targets, and the MicroVM image itself as a first-class
-  `AWS::Serverless::MicrovmImage` resource (name, memory tier, OS
-  capabilities, and lifecycle hooks are all literals on that one resource —
-  see its comment in `template.yaml`). One `sam deploy` provisions all of it,
-  including building/updating the MicroVM image; only the AgentCore
-  web-search gateway is created out-of-band by `deploy.sh` (a CFN resource
-  handler bug with the connector's target config — see that resource's
-  comment).
+## Table of Contents
 
-**Per-user isolation:** each Cognito user gets their own MicroVM and their own
-home directory (an S3 Files access point scoped to their `sub`). Adding a user
-in the pool is all it takes — their first login provisions their VM and home on
-demand.
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Terminals and CLIs](#terminals-and-clis)
+- [Deploying](#deploying)
+- [Security](#security)
+- [Project Structure](#project-structure)
+- [Limitations](#limitations)
+- [Contributing](#contributing)
+- [Changelog](CHANGELOG.md)
+- [Credits](#credits)
+- [License](#license)
 
-Claude Code defaults to **Claude Opus 5**. Use `claude-model opus`,
-`claude-model sonnet`, `claude-model haiku`, or `claude-model fable` for the
-latest available model in each Claude family. Codex `0.154.0` uses Amazon
-Bedrock's current OpenAI catalog: GPT-6 Astra plus GPT-5.6 Sol, Terra, and
-Luna. Use `/model` in Codex to switch, or start `codex-astra` for a new
-Astra session or `codex-grok` for Grok 4.6 through Bedrock. The workspace
-control plane stays in `us-east-1`, while Codex routes its Mantle requests to
-`us-west-2`, where Astra and Grok are available. Kiro CLI needs a one-time
-device-flow login (`kiro-cli login` — see below) before use; once signed in,
-start it with `kiro-cli`. All three tools share workspace files while
-retaining their own configuration, history, and login state under
-`/home/coder`.
+## Quick Start
 
-### Signing in to Kiro CLI
-
-Kiro CLI isn't part of this app's AWS account or Bedrock — it's a separate
-hosted service, so each user authenticates with their own Kiro account. The
-browser terminal has no local browser for Kiro to launch, so it falls back to
-its **device-flow** login automatically:
-
-```
-kiro-cli login
-```
-
-This prints a URL and a one-time code — no port-forwarding or local browser
-needed. Open that URL in **any** browser (your phone, another tab, whatever's
-on hand), sign in (GitHub, Google, AWS Builder ID, IAM Identity Center, or an
-external IdP), and enter the code. Once approved, the session is stored under
-`~/.kiro` in that user's S3 Files-backed home, so it's a **one-time step per
-user** — it survives VM restarts and recycles, not just the current session.
-Check status any time with `kiro-cli whoami`; re-run `kiro-cli login` if a
-session expires.
-
-Kiro's own web-search MCP wiring, steering file, and permissions are
-image-managed the same way as Claude's and Codex's (see "Web search" above) —
-login is the only thing a user has to do by hand.
-
-On each newly mounted workspace, a background refresh runs the official `aws
-configure agent-toolkit --yes` workflow under the workspace user. It installs
-the latest default AWS skills and configures the AWS MCP server for Claude,
-Codex, and Kiro. The image then refreshes the official `aws-core` plugin for
-Claude and Codex. The refresh records progress in
-`~/.agent-toolkit-status`; it does not touch user projects, API keys, or Kiro
-login state.
-
-All three CLIs are configured for unattended work inside this dedicated
-MicroVM. Claude Code uses `bypassPermissions`; Codex bypasses approvals and its
-local sandbox; Kiro has a persistent allow-all policy. The MicroVM remains the
-isolation boundary, and Agent Toolkit safety hooks can still block protected
-operations.
-
----
-
-## Prerequisites
-
-- An AWS account with **Bedrock model access enabled** in **`us-east-1`** for
-  the current Claude family, and in **`us-west-2`** (Bedrock Mantle — where the
-  `codex` wrapper points model calls) for the OpenAI models Codex uses (GPT-6
-  Astra, GPT-5.6 Sol/Terra/Luna) and for xAI's Grok 4.6 (`codex-grok`). The
-  deployed image pins Codex `0.154.0`, which includes Astra in the Amazon
-  Bedrock model picker.
-- **Kiro CLI needs its own account**, unrelated to this AWS account or
-  Bedrock — it's a hosted service. Each user signs in themselves on first use;
-  see [Signing in to Kiro CLI](#signing-in-to-kiro-cli) below.
-- **AWS Lambda MicroVMs** available in your region (this project uses
-  `us-east-1`). MicroVMs are a newer capability — make sure your account/region
-  has access.
-- Local tooling: **AWS CLI v2**, the **AWS SAM CLI**, and **Node.js 20+**. Docker
-  is *not* required — the MicroVM image is built server-side by the build service.
-  Inside the workspace, `kiro-cli login` performs its one-time device-flow login;
-  its persisted session remains in the user's S3 Files-backed home.
-
-The SAM stack provisions everything, including the **S3 Files filesystem** and
-its VPC mount targets (the persistent per-user `/home/coder`). You don't create
-anything by hand — `sam deploy` makes it all.
-
----
-
-## Deploying
-
-**The one command that does everything is `./scripts/deploy.sh`** (see
-[Just run the script](#just-run-the-script) below). If you only want a working
-deployment, skip there.
-
-The rest of this section walks the four layers by hand — infra, frontend, image,
-user — so you can see what the script automates. The snippets build on each
-other: run them in **one shell session**, top to bottom, after the Configure
-step. They're a teaching aid, not a substitute for the script.
-
-### Configure
-
-```bash
-cp samconfig.toml.example samconfig.toml
-$EDITOR samconfig.toml    # set region, and profile if you don't use your default
-```
-
-`samconfig.toml` is how `sam build`/`sam deploy` know the stack name, region,
-profile, and capabilities — nothing in this repo reads it except `sam` itself.
-It's git-ignored (see `samconfig.toml.example` for the committed template), so
-your profile name never gets committed.
-
-Optionally personalize the `admin-create-user` email that shows up in the
-stack's Outputs (cosmetic only — it's not a credential) by uncommenting
-`parameter_overrides` in `samconfig.toml`, e.g.:
-
-```toml
-parameter_overrides = "LoginEmail=\"you@example.com\""
-```
-
-Skip this and it defaults to `you@example.com` — you can always override it
-per-command with `sam deploy --parameter-overrides LoginEmail=...`, or just
-edit the created user's email later. Whatever value CloudFormation last saw
-for `LoginEmail` is retained on every future deploy, since `deploy.sh` never
-passes it itself.
-
-Helper used by every stage below — pulls one stack output by key (relies on
-`sam`'s AWS CLI env resolution, same as everything else here):
-
-```bash
-out() { aws cloudformation describe-stacks --stack-name ipad-claude \
-  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
-```
-
-### Stage 1 — Infrastructure (SAM)
-
-The whole stack is one AWS SAM template (`template.yaml`): the VPC + NAT +
-subnets + NFS security group, the three S3 buckets, the **S3 Files filesystem +
-mount targets**, the Cognito user pool + client, the token-vending Lambda +
-API Gateway (with the Cognito authorizer), CloudFront, the VPC-egress network
-connector, and the MicroVM image itself.
-
-```bash
-sam build
-sam deploy
-```
-
-No flags needed — `samconfig.toml` supplies the stack name, region, profile,
-and capabilities. The very first deploy won't yet have a real
-`MicrovmCodeUri` to pass, so it fails fast on that required parameter; that's
-expected — see [Just run the script](#just-run-the-script) below for the
-one-time bootstrap order. Inspect all outputs any time with:
-
-```bash
-aws cloudformation describe-stacks --stack-name ipad-claude \
-  --query "Stacks[0].Outputs" --output table
-```
-
-### Stage 2 — Frontend (S3 + CloudFront)
-
-The frontend is one static `index.html` with a placeholder line
-`window.APP_CONFIG = {}; /* APP_CONFIG_PLACEHOLDER */`. Replace it with the real
-config — token API URL, region, and Cognito pool/client ids from Stage 1's
-outputs — then upload and invalidate the CDN.
-
-```bash
-REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}"
-CONFIG=$(cat <<JSON
-{"tokenApiUrl":"$(out TokenApiUrl)","region":"$REGION","userPoolId":"$(out UserPoolId)","userPoolClientId":"$(out UserPoolClientId)"}
-JSON
-)
-
-# Replace the whole placeholder line with the injected config.
-sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<script>window.APP_CONFIG = $CONFIG;</script>|" \
-  frontend/index.html > /tmp/index.html
-
-aws s3 cp /tmp/index.html "s3://$(out FrontendBucketName)/index.html"
-aws cloudfront create-invalidation --distribution-id "$(out CloudFrontDistributionId)" --paths "/*"
-```
-
-### Stage 3 — MicroVM image
-
-The image is a real CFN resource (`AWS::Serverless::MicrovmImage` — see
-`MicrovmImage` in `template.yaml`), not a hand-rolled CLI dance. Its
-configuration — name (`remote-dev`), memory tier (4096 MiB baseline), OS
-capabilities, base image, and lifecycle hooks — are all literals on that one
-resource. All you provide from outside is `CodeUri`: an S3 URI to the zipped
-`microvm/` source, passed as the `MicrovmCodeUri` parameter.
-
-```bash
-ARTIFACT_BUCKET=$(out ArtifactBucketName)
-S3_FILES_FS_ID=$(out S3FilesFileSystemId)   # the stack created this in Stage 1
-
-# Render the FS id into a build copy (never commit an account-specific value).
-BUILD_DIR=/tmp/rdev-microvm-build
-rm -rf "$BUILD_DIR"; cp -R microvm "$BUILD_DIR"
-sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$BUILD_DIR/Dockerfile"
-rm -f "$BUILD_DIR/Dockerfile.bak"
-
-# Content-hash the zip into its S3 key: CloudFormation only diffs property
-# VALUES, and MicrovmImage's CodeUri isn't in SAM's auto-upload list (unlike
-# a Function's CodeUri), so a fixed key would silently never trigger a
-# rebuild on a real change.
-ZIP_PATH=/tmp/rdev-microvm.zip
-rm -f "$ZIP_PATH"; (cd "$BUILD_DIR" && zip -r "$ZIP_PATH" . -x "*.DS_Store")
-ZIP_HASH=$(shasum -a 256 "$ZIP_PATH" | cut -c1-16)
-ZIP_KEY="microvm/remote-dev-microvm-${ZIP_HASH}.zip"
-aws s3 cp "$ZIP_PATH" "s3://$ARTIFACT_BUCKET/$ZIP_KEY"
-
-sam deploy --parameter-overrides "MicrovmCodeUri=s3://$ARTIFACT_BUCKET/$ZIP_KEY"
-```
-
-`sam deploy` waits on CloudFormation's own stabilization for the image build
-(~5-10 min on a real change to `microvm/`) — no manual polling needed. If
-`microvm/` hasn't changed, the hash produces the same key and CodeUri comes
-out identical, so CloudFormation no-ops the resource. Changing
-`AdditionalOsCapabilities` is now an ordinary in-place update too (the old
-CLI-based flow required deleting and recreating the image for that).
-
-**You don't launch a persistent MicroVM here** — the token Lambda does that
-per user, on demand: when a user logs in, it reads their verified Cognito
-`sub`, creates their S3 Files access point, and calls `run-microvm` with the
-access-point id in `--run-hook-payload` (the `/run` hook mounts it). The
-ingress connectors expose HTTP (the terminal) and SHELL (the `tools/` helpers);
-the egress connector reaches the S3 Files mount targets.
-
-### Stage 4 — Create a user
-
-Auth is Cognito with no self-signup, so you create users yourself. `sam
-deploy` already printed a ready-to-run command for this as the
-`CreateUserCommand` output (built from the `LoginEmail` parameter you set in
-Configure) — just copy it from the deploy output, or fetch it again any time:
-
-```bash
-out CreateUserCommand
-```
-
-It looks like:
-
-```bash
-aws cognito-idp admin-create-user \
-  --user-pool-id <pool-id> --username you@example.com \
-  --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true \
-  --temporary-password 'ChangeMe-123!'
-```
-
-This creates the user with a **temporary password**. On first sign-in the app
-prompts them to choose a new permanent one (Cognito's standard
-`NEW_PASSWORD_REQUIRED` flow, which the login screen handles).
-
-- Run it as printed to set that temp password yourself.
-- To skip the first-login prompt entirely and set a ready-to-use password:
-  ```bash
-  aws cognito-idp admin-set-user-password \
-    --user-pool-id "$(out UserPoolId)" --username you@example.com \
-    --password 'YourReal-Password1!' --permanent
-  ```
-
-Now open the CloudFront URL, sign in with that email and password, and you're in
-the terminal — with your own MicroVM and persistent home.
-
-### Just run the script
-
-`scripts/deploy.sh` does all of the above end-to-end: ensures the AgentCore
-web-search gateway, packages and uploads the MicroVM source, runs
-`sam build` + `sam deploy` (which creates/updates the stack **and** the
-MicroVM image in one shot), syncs the frontend config, then launches a
-throwaway VM to smoke-test the image and tears it down. `sam deploy` itself
-prints `TokenApiUrl`, `FrontendUrl`, `UserPoolId`, `LoginEmail`, and
-`CreateUserCommand` as part of its own output — deploy.sh doesn't repeat them.
-It does **not** launch a persistent VM — that happens per user at login.
-
-```bash
+```shell
+git clone https://github.com/gunnargrosch/bivack
+cd bivack
+cp deploy.env.example deploy.env
+$EDITOR deploy.env          # AWS_PROFILE, AWS_REGION, LOGIN_EMAIL
 ./scripts/deploy.sh
 ```
 
-| Flag | Effect |
-|---|---|
-| *(none)* | Full deploy: web-search gateway + SAM stack (incl. image) + frontend + smoke test |
-| `--skip-infra` | Reuse the existing stack outputs — frontend sync + smoke test only |
-| `--skip-mvm` | Deploy infra/image but skip the throwaway smoke-test VM |
+The first run bootstraps the stack, builds the IDE, packages the MicroVM image, uploads the frontend, creates your first login, smoke-tests a throwaway VM, and prints the URL. Later runs reuse whatever has not changed.
 
-**Bootstrapping a brand-new stack:** `deploy.sh` resolves `ArtifactBucketName`
-and `WebSearchGatewayRoleArn` from the stack's *existing* outputs before it
-can compute `MicrovmCodeUri`/`WebSearchGatewayUrl` — so the very first-ever
-deploy needs one bare `sam build && sam deploy` first (Stage 1 above) to
-create the bucket and role, and it's expected to fail on the required
-`MicrovmCodeUri` parameter with nothing to pass yet. Once that first partial
-deploy has created the bucket + role, run `./scripts/deploy.sh` normally and
-it takes over from there. Every deploy after that is just `./scripts/deploy.sh`.
+| Requirement | Notes |
+| --- | --- |
+| AWS CLI v2 | authenticated (`aws configure`, `aws sso login`, or a named profile) |
+| AWS SAM CLI | builds and deploys the stack |
+| Node.js 20+ and npm | builds the IDE |
+| `zip`, `python3` | packaging and small helpers in the scripts |
+| AWS Lambda MicroVMs | available in your region; the examples use `us-east-1` |
 
----
+Docker is not required. The MicroVM image is built server-side by the Lambda MicroVMs build service.
 
-## Operations
+## Architecture
 
-Deploying is the only script you need for normal use — once `deploy.sh`
-finishes, everything runs from the browser. The helpers in `tools/` are
-optional break-glass utilities for reaching *into* a running MicroVM (which has
-no SSH; access is over the service ingress connectors). They read
-`AWS_PROFILE` / `AWS_REGION` from your environment — export them first:
+```mermaid
+flowchart TD
+    UI["Browser<br/>terminal · VS Code workbench"]
+    CF["CloudFront<br/>(static frontend)"]
+    COG["Cognito User Pool"]
+    APIGW["API Gateway<br/>(Cognito authorizer)"]
+    TOKEN["Token Lambda<br/>find/create home · launch/resume VM · mint token"]
+    MVM["Per-user MicroVM<br/>Claude Code · Codex · OpenCode · Kiro · zsh"]
+    S3F[("S3 Files<br/>/home/coder<br/>per-user access point")]
 
-```bash
-export AWS_PROFILE=your-profile AWS_REGION=us-east-1
-cd tools && npm install && cd ..   # first time only (installs the `ws` client)
+    UI -->|HTTPS| CF
+    UI -->|sign in| COG
+    UI -->|"GET /token (JWT)"| APIGW
+    APIGW --> TOKEN
+    TOKEN -.->|"{ authToken, endpoint }"| UI
+    UI -->|"WebSocket (subprotocol auth)"| MVM
+    MVM -->|"mount (lifecycle hook)"| S3F
 ```
 
-MicroVMs are per-user, so both tools need to know **which** user's VM to reach —
-pass `--user <email>` (or set `IPAD_CLAUDE_USER`). The user must have logged in
-at least once so their VM exists.
+| Piece | What it does |
+| --- | --- |
+| **Frontend** | Chooser at `/`, terminal at `/cli/`, VS Code workbench at `/ide/`, shared login at `/login/`. Static from S3 behind CloudFront. The terminal installs as a PWA and shows a touch key bar on any coarse-pointer device. In the workbench, the File menu's "Go to Bivack Home" returns to the chooser. |
+| **Auth** | Cognito user pool, admin-created users only. API Gateway's Cognito authorizer validates the JWT before the token Lambda runs. |
+| **Token Lambda** | Reads the verified `sub`, finds-or-creates that user's S3 Files access point (`/users/<sub>`), launches or resumes their MicroVM, and mints a short-lived auth token. Hand-rolled SigV4. |
+| **MicroVM image** | Amazon Linux 2023 with Node, Python 3.13, git, `gh`, the AWS CLI, `uv`, and the four coding CLIs. `terminal.js` serves the PTY over WebSocket; `ide-agent.js` serves the workbench's file system and terminal on a second port. |
+| **Home** | The `/run` lifecycle hook mounts the per-user S3 Files access point at `/home/coder` (`mount -o accesspoint=<id>`), so each user's home is isolated and survives restarts. |
+| **Egress** | The private subnets reach the internet through a NAT instance by default (a `t4g.nano` running `iptables` masquerade, about $3/month) or an AWS NAT Gateway when `NAT_MODE=gateway` (about $33/month). This is the path MicroVMs use to reach model providers and package registries. The instance is patched weekly by an SSM association (`AWS-RunPatchBaseline`); a NAT Gateway needs no patching. |
+| **Web search** | Each CLI uses its own built-in web tools; no MCP server is wired up. |
 
-- **Interactive shell into a user's MicroVM** (SSH-equivalent, over SHELL_INGRESS):
+## Terminals and CLIs
 
-  ```bash
-  node tools/exec.js --user you@example.com          # drops to the `coder` user (zsh)
-  node tools/exec.js --user you@example.com --root   # stay root (changes don't persist)
-  ```
+Each CLI signs in once and keeps its session under `/home/coder`.
 
-  Double `Ctrl+C` to disconnect.
+| CLI | Command | First-run login |
+| --- | --- | --- |
+| Claude Code | `claude` | sign in with your Claude plan |
+| Codex | `codex` | sign in with your OpenAI account |
+| OpenCode | `opencode` | `/connect` to add a provider |
+| Kiro CLI | `kiro-cli` | `kiro-cli login` (device flow) |
 
-- **Run a one-off command in a user's MicroVM** (non-interactive — handy for
-  scripting or quick inspection):
+All of them share workspace files while keeping their own configuration and history. Each is configured for unattended work inside its dedicated MicroVM: Claude Code uses `bypassPermissions`, Codex bypasses approvals and its local sandbox, and Kiro has a persistent allow-all policy. The MicroVM is the isolation boundary.
 
-  ```bash
-  node tools/run-remote.js --user you@example.com 'uname -a' 60   # cmd, optional timeout
-  ```
+**Kiro CLI** is a hosted service unrelated to your AWS account. The browser terminal has no local browser, so `kiro-cli login` prints a URL and a one-time code; open it anywhere, sign in, and the session is stored under `~/.kiro` for good. Check it with `kiro-cli whoami`.
 
-- **Logs / debugging:** `cat /tmp/hooks.log` inside the MicroVM shows the S3
-  Files mount attempts; app logs are in CloudWatch under
-  `/aws/lambda-microvms/<image-name>`.
+## Deploying
 
----
+### Configuration
+
+`deploy.env` is git-ignored and created for you from `deploy.env.example`:
+
+| Key | Meaning |
+| --- | --- |
+| `AWS_PROFILE` | named AWS CLI profile (leave unset for the default profile) |
+| `AWS_REGION` | region to deploy into |
+| `LOGIN_EMAIL` | first Cognito login; deploy.sh creates it, and the monthly budget alerts here by default |
+| `STACK_NAME` | optional, defaults to `bivack`; prefixes every AWS resource |
+| `MEMORY_MIB` | optional; MicroVM memory tier (512, 1024, 2048, 4096, 8192), default 4096 |
+| `IDLE_MAX_SECONDS` | optional; seconds without inbound traffic before a VM suspends, default 7200 |
+| `IDLE_SUSPEND_SECONDS` | optional; seconds a suspended VM stays resumable, default 1800 |
+| `MAX_LIFETIME_SECONDS` | optional; hard maximum VM lifetime, default 28800 |
+| `BUDGET_USD` | optional; monthly cost budget in USD, default 25 |
+| `BUDGET_ENABLED` | optional; `true` (default) creates the monthly budget, `false` skips it |
+| `BUDGET_EMAIL` | optional; budget alert recipient, defaults to `LOGIN_EMAIL` |
+| `NAT_MODE` | optional; private-subnet egress: `instance` (default, ~$3/mo) or `gateway` (~$33/mo) |
+
+### What deploy.sh does
+
+1. Checks the required tools and your AWS credentials.
+2. First deploy only: bootstraps the stack without the MicroVM image, to create the buckets and roles.
+3. Builds the IDE when its sources changed (or `ide/dist` is missing).
+4. Packages `microvm/` and deploys the stack with the image.
+5. Uploads the frontend and IDE to S3 and invalidates CloudFront.
+6. Creates the first login from `LOGIN_EMAIL` (temporary password `ChangeMe-123!`, changed on first sign-in).
+7. Launches a throwaway MicroVM, probes the S3 Files mount and outbound internet, then terminates it.
+
+### Flags
+
+| Flag | Effect |
+| --- | --- |
+| *(none)* | build what changed, then deploy |
+| `--frontend-only` | re-upload the frontend and IDE only; no SAM, no image |
+| `--no-smoke` | skip the throwaway smoke-test VM |
+| `--build-ide` | force an IDE rebuild |
+| `--review` | show the CloudFormation changeset and confirm before applying |
+
+### Upgrading
+
+Pull and run the same command:
+
+```shell
+git pull
+./scripts/deploy.sh
+```
+
+`deploy.sh` rebuilds only what changed: the IDE when its sources changed, the MicroVM image when `microvm/` changed (5-10 minutes), and the frontend every time. The S3 Files home and the buckets are not touched, so user files, history, and logins survive. Keep `STACK_NAME` unchanged; a different name stands up a new stack instead of upgrading.
+
+After a MicroVM image upgrade, running VMs keep the old image until they recycle (they suspend on idle and terminate after their maximum lifetime). To move a user onto the new image immediately, terminate their VM from the terminal's power button and reload; the next sign-in launches a fresh VM from the newest image.
+
+To review an infrastructure change before applying it:
+
+```shell
+./scripts/deploy.sh --review
+```
+
+This prints the CloudFormation changeset and waits for confirmation. Check for `Replace` on stateful resources (`UserPool`, `WorkspaceBucket`, `S3FilesFileSystem`); a replacement there would drop users or data, so migrate deliberately rather than confirming. Bumping `S3FilesFileSystem`'s `ClientToken` is the deliberate exception: it forces a replacement and is the recovery path for a wedged synchronization state.
+
+### Tearing down
+
+```shell
+./scripts/teardown.sh          # prompts for the stack name
+./scripts/teardown.sh --yes    # no prompt
+```
+
+Removes the stack, all three buckets (the workspace and artifact buckets are `Retain`, so it empties them including versions), the Cognito pool, every SSM parameter under the stack prefix, running MicroVMs, the MicroVM images, and the log groups. Safe to re-run.
+
+### Inspecting
+
+```shell
+aws cloudformation describe-stacks --stack-name bivack \
+  --query "Stacks[0].Outputs" --output table
+
+# Reach into a running MicroVM (break-glass; there is no SSH)
+set -a; . ./deploy.env; set +a
+cd tools && npm install && cd ..            # first time only
+node tools/exec.js --user you@example.com   # interactive shell
+node tools/run-remote.js --user you@example.com 'uname -a'
+```
+
+`BIVACK_USER` can replace `--user`. The user must have logged in at least once so their VM exists.
 
 ## Security
 
-Auth and isolation are real (Cognito + per-user MicroVMs + per-user homes), but
-a few things still warrant care before you point it at anything sensitive:
+- **Auth is Cognito, per-user.** Users are admin-created (no self-signup); each gets their own MicroVM and a home isolated to their `sub`. API Gateway validates the JWT before the Lambda runs.
+- **The VM starts with no AWS credentials.** Its own role (`MicroVmExecutionRole`) only mounts S3 Files and looks up its own endpoint, so it grants nothing against your accounts. To use AWS, authenticate inside the VM, for example `aws sso login --no-browser` or `aws configure sso`; profiles and credentials persist under `~/.aws` in the home. Provider logins (Claude, Codex, OpenCode, Kiro, and `gh`) also live in each user's home.
+- **`coder` has passwordless `sudo` inside its own VM.** Fine, since the VM and home are per-user, but a user is root within their own sandbox.
+- **Model-provider spend** is billed to each user's own provider account. There is no sandbox-level cap.
+- **No network isolation of the workload.** MicroVMs have open outbound internet by default.
 
-- **Auth is Cognito, per-user.** Users are admin-created (no self-signup); each
-  gets their own MicroVM and a home directory isolated to their `sub`. API
-  Gateway validates the JWT before the Lambda runs. Note the `coder` user has
-  passwordless `sudo` **inside their own VM** — fine, since the VM and home are
-  per-user, but it does mean a user is root within their own sandbox.
-- **Broad AWS privileges — the main thing to scope.** The MicroVM runs as
-  `MicroVmExecutionRole`: **`PowerUserAccess`** (full access to AWS services)
-  **plus boundary-gated IAM writes** so full-stack deploys (`sam deploy`, CDK)
-  work from inside the sandbox. The escalation guardrail is a permissions
-  boundary (`SandboxPermissionsBoundary`): every role created from the sandbox
-  must carry it, it caps those roles at the sandbox's own privilege level, and
-  it self-propagates to roles *they* create. IAM users/access keys are never
-  grantable, the boundary itself can't be edited or detached, and the
-  sandbox's own `ipad-claude-*` roles are off-limits. Anything Claude (or the
-  user) runs in the terminal wields these credentials (resolved from the
-  instance role via IMDS), **and every user's VM shares this one role**.
-  Scope `MicroVmExecutionRole` down in `template.yaml` to only the services
-  your sandbox needs before using it anywhere real.
-- **Bedrock spend.** VMs can call Bedrock freely; there's no per-user budget cap
-  wired in. Add one if runaway usage is a concern.
-- **Web search spend.** AgentCore Web Search is billed per query (~$7 per 1,000
-  at time of writing) and, like Bedrock, has no per-user cap wired in. The
-  gateway is shared across all users' VMs.
-- **No network isolation of the workload.** MicroVMs have open outbound internet
-  by default.
+For a production multi-tenant deployment you would additionally want spend controls and egress restrictions.
 
-For a production multi-tenant deployment you'd additionally want a per-user
-(or per-tenant) scoped execution role rather than one shared `PowerUserAccess`
-role, plus spend controls and egress restrictions.
-
-### Deploying from inside the sandbox
-
-The sandbox can run full-stack deploys (`sam deploy`, CDK, CloudFormation)
-including role creation — with one requirement: **every IAM role created from
-inside the sandbox must carry the permissions boundary**
+## Project Structure
 
 ```
-arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary
-```
-
-(get the account id from `aws sts get-caller-identity`). A `CreateRole`
-without it is denied — if a deploy fails with `AccessDenied` on
-`iam:CreateRole`, a missing boundary is almost always why. How to attach it:
-
-- **SAM** — all function roles at once, in `template.yaml`:
-
-  ```yaml
-  Globals:
-    Function:
-      PermissionsBoundary: arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary
-  ```
-
-  or per-role via the `PermissionsBoundary` property on `AWS::IAM::Role`.
-
-- **CDK** — apply it to the whole app so every construct-created role gets it:
-
-  ```json
-  // cdk.json
-  { "context": { "@aws-cdk/core:permissionsBoundary": {
-      "name": "ipad-claude-sandbox-boundary" } } }
-  ```
-
-  or per-role: `new iam.Role(..., { permissionsBoundary:
-  iam.ManagedPolicy.fromManagedPolicyName(this, 'Pb', 'ipad-claude-sandbox-boundary') })`.
-
-- **CLI** —
-
-  ```bash
-  aws iam create-role --role-name my-role \
-    --permissions-boundary arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary \
-    --assume-role-policy-document file://trust.json
-  ```
-
-The boundary caps created roles at the sandbox's own privilege level and
-propagates itself: roles created from the sandbox can create further roles,
-but only ones carrying the same boundary. The in-VM `CLAUDE.md` briefing
-carries these same instructions, so Claude inside the sandbox handles this
-automatically.
-
----
-
-## Repo layout
-
-```
-template.yaml         the SAM template — all AWS infrastructure, including
-                       the MicrovmImage resource (name/memory/capabilities/
-                       hooks all literal on that one resource)
-samconfig.toml.example  copy to samconfig.toml and fill in (git-ignored)
+template.yaml          all AWS infrastructure, including the MicroVM image as an
+                       AWS::Serverless::MicrovmImage resource
+deploy.env.example     copy to deploy.env and fill in (git-ignored)
+NOTICE                 upstream attribution (Remote Developer / Eric Johnson)
 functions/
-  token-vend/         token-vending Lambda (SigV4, Cognito sub, MicroVM lifecycle)
-frontend/index.html   the xterm.js terminal + Cognito login screen
-microvm/              MicroVM image
-  Dockerfile          AL2023 + Node/Python/uv/AWS CLI + Claude Code, Codex, Kiro CLI
-  entrypoint.sh       starts hooks.js + terminal.js
-  hooks.js            lifecycle hooks — mounts the per-user home on /run;
-                      /validate exercises the cold path for platform prefetch
-  mount-home.sh       per-user S3 Files mount (-o accesspoint); refreshes every
-                      image-owned CLI config below on every mount
-  terminal.js         WebSocket PTY server (ttyd protocol)
-  zshrc / bashrc      seeded shell config
-  skills/             seeded Claude Code skills
-
-  # Web search (all three CLIs, via the AgentCore gateway)
-  mcp-config.js            registers the web-search MCP server into a JSON
-                            config — used for ~/.claude.json (Claude) and
-                            ~/.kiro/settings/mcp.json (Kiro)
-  codex-mcp-config.sh      registers the same server for Codex
-                            (~/.codex/config.toml) with a hardlink-safe uv cache
-
-  # Claude Code
-  claude-model             picks the latest model in a family (opus/sonnet/
-                            haiku/fable) and launches `claude`
-  claude-settings-config.js  refreshes bypassPermissions without touching the
-                            user's other settings/plugins
-
-  # Codex CLI
-  codex                    default wrapper — unattended, Bedrock Mantle (us-west-2)
-  codex-astra              Codex session pinned to GPT-6 Astra
-  codex-grok               Codex session pinned to Grok 4.6 (native web_search
-                            off; workspace-web-search MCP covers current info)
-  codex-briefing.md        Codex's image-managed AGENTS.md briefing
-
-  # Kiro CLI
-  kiro-microvm.md          Kiro's image-managed steering file
-  kiro-permissions.yaml    Kiro's unattended, allow-all permissions (the VM
-                            itself is the isolation boundary)
-
-  # Shared
-  agent-toolkit-bootstrap.sh  runs `aws configure agent-toolkit --yes` and
-                            refreshes the aws-core plugin for Claude + Codex
+  token-vend/          token Lambda: S3 Files access point, MicroVM lifecycle, auth token
+frontend/              chooser, terminal (PWA), login, shared VS Code theme
+  landing.html         chooser at /
+  index.html           xterm.js terminal at /cli/ (PWA entry point)
+  login.html           shared login at /login/
+  vscode.css           Dark Modern tokens shared by the pages
+  landing.css / login.css / cli.css   per-page styles
+ide/                   the embedded VS Code workbench (Vite + monaco-vscode-api)
+  src/main.ts          workbench bootstrap and service overrides
+  src/wsfs.ts          vscode.FileSystemProvider over the WebSocket
+  src/wsclient.ts      WebSocket client with reconnect
+  src/terminal.ts      workbench terminal backend
+  src/auth.ts          Cognito session and token API
+  src/authprovider.ts  Cognito account provider for the Accounts menu
+microvm/               MicroVM image
+  Dockerfile           AL2023 + Node/Python/uv/git/gh/AWS CLI + the coding CLIs
+  entrypoint.sh        starts hooks.js, ide-agent.js, and terminal.js
+  hooks.js             lifecycle hooks: mounts the home on /run, samples the
+                       cold path on /validate
+  mount-home.sh        per-user S3 Files mount and image-owned config refresh
+  terminal.js          WebSocket PTY server (ttyd protocol)
+  ide-agent.js         WebSocket file/terminal agent for the workbench
+  agents/AGENTS.md     shared environment briefing, seeded to all four agents
+  shell/
+    env.sh             shared environment, sourced by both rc files
+    zshrc / bashrc     seeded shell config
+  claude/
+    settings.js        refreshes unattended Claude mode, leaving other settings alone
+  codex/
+    run.sh             default wrapper: unattended, OpenAI login
+  kiro/
+    permissions.yaml   Kiro's unattended, allow-all permissions
 scripts/
-  deploy.sh           end-to-end deploy (web search + SAM + frontend + smoke test)
-  deploy-dev.sh        pushes a build to /dev.html on the same bucket/CDN — for
-                       quick frontend iteration without touching production
-  deploy-dev-image.sh  builds a separate, CLI-managed dev MicroVM image
-                       (ipad-claude-dev) from the working tree, for rapid
-                       microvm/ iteration without touching the production image
-tools/                optional break-glass utilities for a running MicroVM
-  exec.js / exec.sh   interactive local shell into a user's MicroVM
-  run-remote.js       non-interactive remote command runner
-  resolve-mvm.js      shared: email → Cognito sub → per-user MicroVM
+  deploy.sh            one-command deploy
+  teardown.sh          removes the stack and everything it leaves behind
+tools/                 break-glass utilities for a running MicroVM
+  exec.js / exec.sh    interactive shell into a user's MicroVM
+  run-remote.js        non-interactive remote command runner
+  resolve-mvm.js       shared: email -> Cognito sub -> per-user MicroVM
+  smoke-probe.js       deploy-time mount + internet probe
 ```
 
----
+## Limitations
+
+- **Web extensions only in the IDE.** The workbench is the browser build of VS Code, so only extensions with a web entrypoint install. Desktop-only extensions show "not available in the web platform". Microsoft and GitHub sign-in and Settings Sync are not available either; they are Microsoft-hosted built-ins.
+- **No git in the IDE.** The browser cannot spawn the git binary and monaco-vscode-api does not ship VS Code's git extension, so Source Control has no provider. Use `git` and `gh` in the terminal tab.
+- **MicroVM ingress.** The endpoint accepts the auth token only in the `X-aws-proxy-auth` header. A browser cannot set that header on navigation or subresource loads, which is why the IDE is a self-hosted workbench talking to the VM over WebSocket rather than a served web IDE.
+- **IDE settings are per-browser.** The workbench keeps user settings (theme, keybindings) in browser storage, not the VM, so they do not follow you across browsers or survive clearing site data. Workspace settings (`.vscode/settings.json`) do live in the VM. Auto-save starts off and tooling dotfiles are hidden with `files.exclude`; both are overridable defaults.
+- **The home is network storage.** `/home/coder` is S3 Files over NFS, so many small file operations are slower than local disk, which shows when a CLI scans its config or caches. The bucket is versioned (S3 Files requires it) and noncurrent versions expire after 7 days.
+- **One region.** The stack targets a single region; MicroVM availability varies.
+
+## Contributing
+
+Contributions are welcome: bug reports, feature ideas, and pull requests. For anything non-trivial, open a [GitHub issue](https://github.com/gunnargrosch/bivack/issues) first so the approach can be agreed before you build it.
+
+### Development setup
+
+The deploy script is also the development loop; there is no separate dev server. [Quick Start](#quick-start) has the clone and deploy steps. `--review` previews infrastructure changes before applying them, and `--frontend-only` re-uploads the frontend and IDE without a stack update.
+
+### Making a change
+
+- Branch off `main` and keep each pull request to one thing.
+- Follow [Conventional Commits](https://www.conventionalcommits.org): `type(scope): description`, with `feat`, `fix`, `docs`, `refactor`, `test`, or `chore`.
+- Run the deploy before opening the pull request. It rebuilds whatever changed and smoke-tests a throwaway MicroVM, so a clean run means the image still boots with the home mounted and outbound internet working.
+- For a frontend or IDE change, `./scripts/deploy.sh --frontend-only` is enough; build the IDE first if you changed it. For a `microvm/` change, expect a 5-10 minute image rebuild.
+- When a change is worth users updating to (a MicroVM image or `template.yaml` change especially), add a [CHANGELOG](CHANGELOG.md) entry and cut a release: `gh release create vX.Y.Z --generate-notes`. Older deployments show an "update available" nudge in the footer.
+
+### What to be careful with
+
+- **Stateful resources.** `UserPool`, `WorkspaceBucket`, and `S3FilesFileSystem` hold users and data. A change that makes CloudFormation replace them drops that data. Check with `--review` and call it out in the pull request.
+- **Image size and cold start.** The MicroVM image is snapshotted and prefetched, so large additions slow the first launch. Keep the `/validate` hook in step with what a real session touches.
+- **No AWS credentials in the sandbox, by design.** Do not add broad AWS access back; see [Security](#security).
+
+All contributions are accepted under the project's [MIT-0 license](#license).
+
+## Credits
+
+Bivack is a derivative of [Remote Developer (rDev)](https://github.com/singledigit/microvm-dev-environment) by [Eric Johnson](https://github.com/singledigit), used under the MIT-0 license. The upstream copyright is retained in [NOTICE](NOTICE).
 
 ## License
 
