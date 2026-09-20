@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Bivack">
+  <rect width="512" height="512" rx="96" fill="#1f1f1f"/>
+  <text x="50%" y="55%" text-anchor="middle" dominant-baseline="middle"
+        font-family="Menlo, 'SF Mono', monospace" font-size="200" font-weight="700"
+        letter-spacing="-14" fill="#4daafc">Bivack</text>
+</svg>

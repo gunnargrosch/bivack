@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#181818" />
+<title>Bivack · cloud dev sandbox for coding agents</title>
+<link rel="icon" href="./cli/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="/vscode.css" />
+<script>window.APP_CONFIG = {}; /* APP_CONFIG_PLACEHOLDER */</script>
+<script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
+<link rel="stylesheet" href="/landing.css">
+</head>
+<body>
+<div class="win">
+  <div class="titlebar">
+    <span class="brand">Bivack</span>
+    <div class="titlebar-right">
+      <span class="meta">Choose a workspace</span>
+      <button class="tool-btn" onclick="signOut()" title="Sign out" aria-label="Sign out">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 2.5H3.5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h3"/><path d="M10 5l3 3-3 3"/><path d="M13 8H6.5"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="tabbar">
+    <span class="tab"><span class="glyph">&#9671;</span> Welcome</span>
+  </div>
+  <main class="welcome">
+    <h1>Bivack</h1>
+    <p class="lede">Your cloud dev sandbox for coding agents.</p>
+    <a class="action" href="./cli/">
+      <span class="action-icon">&gt;_</span>
+      <span class="action-body">
+        <span class="action-title">CLI</span>
+        <span class="action-desc">Terminal and coding agents</span>
+      </span>
+    </a>
+    <a class="action" href="./ide/">
+      <span class="action-icon">&#9671;</span>
+      <span class="action-body">
+        <span class="action-title">IDE</span>
+        <span class="action-desc">VS Code in the browser</span>
+      </span>
+    </a>
+  </main>
+  <footer class="app-footer">
+    <span>Bivack <span id="app-version"></span> <a id="app-update" class="update" hidden target="_blank" rel="noopener">update available</a></span>
+    <a id="app-repo" href="https://github.com/gunnargrosch/bivack" target="_blank" rel="noopener">GitHub</a>
+  </footer>
+</div>
+<script>
+window.signOut = function () {
+  try {
+    const CONFIG = window.APP_CONFIG || {};
+    const pool = new AmazonCognitoIdentity.CognitoUserPool({
+      UserPoolId: CONFIG.userPoolId,
+      ClientId: CONFIG.userPoolClientId,
+    });
+    pool.getCurrentUser()?.signOut();
+  } catch (e) { /* nothing to clear */ }
+  location.replace('./login/');
+};
+
+(function () {
+  const CONFIG = window.APP_CONFIG || {};
+  if (!CONFIG.userPoolId || !CONFIG.userPoolClientId) return;
+  try {
+    const pool = new AmazonCognitoIdentity.CognitoUserPool({
+      UserPoolId: CONFIG.userPoolId,
+      ClientId: CONFIG.userPoolClientId,
+    });
+    const user = pool.getCurrentUser();
+    if (!user) { location.replace('./login/?next=/'); return; }
+    user.getSession((e, s) => { if (e || !s || !s.isValid()) location.replace('./login/?next=/'); });
+  } catch (e) { /* no session available */ }
+})();
+
+(function () {
+  const CONFIG = window.APP_CONFIG || {};
+  const v = document.getElementById('app-version');
+  if (v) {
+    const tagged = CONFIG.release && CONFIG.release !== 'dev';
+    v.textContent = tagged ? CONFIG.release : (CONFIG.build ? `dev (${CONFIG.build})` : 'dev');
+    if (CONFIG.build) v.title = `Build ${CONFIG.build}`;
+  }
+  const r = document.getElementById('app-repo');
+  if (r && CONFIG.repo) r.href = CONFIG.repo;
+
+  // Show "update available" only when the latest GitHub release is newer than
+  // the running one. Needs a public repo (the GitHub API is unauthenticated).
+  const m = (CONFIG.repo || '').match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/);
+  if (!m || !CONFIG.release || CONFIG.release === 'dev') return;
+
+  const parse = (s) => String(s).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const newer = (tag) => {
+    const a = parse(tag), b = parse(CONFIG.release);
+    for (let i = 0; i < 3; i++) {
+      if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
+    }
+    return false;
+  };
+  const show = (tag, url) => {
+    if (!tag || !newer(tag)) return;
+    const a = document.getElementById('app-update');
+    if (!a) return;
+    a.href = url || `${CONFIG.repo}/releases/tag/${tag}`;
+    a.textContent = `update available (${tag})`;
+    a.hidden = false;
+  };
+
+  // Cache for an hour so reloads stay well inside the unauthenticated rate limit.
+  const KEY = 'bivack-latest-release';
+  try {
+    const c = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (c && c.at && Date.now() - c.at < 3600000) { show(c.tag, c.url); return; }
+  } catch (e) { /* storage unavailable */ }
+
+  fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`, {
+    headers: { Accept: 'application/vnd.github+json' },
+  })
+    .then((resp) => (resp.ok ? resp.json() : null))
+    .then((rel) => {
+      if (!rel || !rel.tag_name) return;
+      try { localStorage.setItem(KEY, JSON.stringify({ tag: rel.tag_name, url: rel.html_url, at: Date.now() })); } catch (e) { /* ignore */ }
+      show(rel.tag_name, rel.html_url);
+    })
+    .catch(() => { /* offline or a private repo */ });
+})();
+</script>
+</body>
+</html>

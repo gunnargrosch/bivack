@@ -1,0 +1,15 @@
+{
+  "name": "Bivack - Portable cloud dev sandbox",
+  "short_name": "Bivack",
+  "description": "Browser terminal for a personal cloud dev sandbox",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#1f1f1f",
+  "theme_color": "#181818",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}

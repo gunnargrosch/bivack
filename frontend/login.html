@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#181818" />
+<title>Bivack — Sign in</title>
+<link rel="icon" href="/cli/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="/vscode.css" />
+<script>window.APP_CONFIG = {}; /* APP_CONFIG_PLACEHOLDER */</script>
+<script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
+<link rel="stylesheet" href="/login.css">
+</head>
+<body>
+<div class="win">
+  <div class="titlebar">
+    <span class="brand">Bivack</span>
+    <span class="meta">Sign in</span>
+  </div>
+  <main class="login-area">
+    <form id="form" class="dialog">
+      <h2>Sign in</h2>
+      <p class="hint">Your cloud dev sandbox for coding agents.</p>
+      <div class="field">
+        <input class="vscode" type="email" id="email" placeholder="Email" autocomplete="email" inputmode="email" />
+        <input class="vscode" type="password" id="password" placeholder="Password" autocomplete="current-password" />
+      </div>
+      <div id="err" class="error"></div>
+      <button id="btn" type="submit" class="vscode">Sign In</button>
+    </form>
+    <form id="np-form" class="dialog" hidden>
+      <h2>Choose a new password</h2>
+      <p class="hint">At least 12 characters, including an uppercase letter, a lowercase letter, and a number.</p>
+      <div class="field">
+        <input class="vscode" type="password" id="np-password" placeholder="New password" autocomplete="new-password" />
+        <input class="vscode" type="password" id="np-confirm" placeholder="Confirm new password" autocomplete="new-password" />
+      </div>
+      <div id="np-err" class="error"></div>
+      <button id="np-btn" type="submit" class="vscode">Set password</button>
+    </form>
+  </main>
+  <footer class="app-footer">
+    <span>Bivack <span id="app-version"></span> <a id="app-update" class="update" hidden target="_blank" rel="noopener">update available</a></span>
+    <a id="app-repo" href="https://github.com/gunnargrosch/bivack" target="_blank" rel="noopener">GitHub</a>
+  </footer>
+</div>
+<script>
+(function () {
+  const CONFIG = window.APP_CONFIG || {};
+  const params = new URLSearchParams(location.search);
+  const safeNext = (v) => (v && v.startsWith('/') && !v.startsWith('//') ? v : '/');
+  const next = safeNext(params.get('next'));
+  const err = document.getElementById('err');
+  const btn = document.getElementById('btn');
+  if (!CONFIG.userPoolId || !CONFIG.userPoolClientId) { err.textContent = 'Auth not configured.'; return; }
+
+  const pool = new AmazonCognitoIdentity.CognitoUserPool({
+    UserPoolId: CONFIG.userPoolId,
+    ClientId: CONFIG.userPoolClientId,
+  });
+  const existing = pool.getCurrentUser();
+  if (existing) {
+    existing.getSession((e, s) => { if (!e && s && s.isValid()) location.replace(next); });
+  }
+
+  const form = document.getElementById('form');
+  const email = document.getElementById('email');
+  const password = document.getElementById('password');
+  const done = () => { btn.disabled = false; btn.textContent = 'Sign In'; };
+
+  // Shown when Cognito reports the temporary password must be replaced.
+  const npForm = document.getElementById('np-form');
+  const npPassword = document.getElementById('np-password');
+  const npConfirm = document.getElementById('np-confirm');
+  const npErr = document.getElementById('np-err');
+  const npBtn = document.getElementById('np-btn');
+  let pendingUser = null;
+
+  // Mirrors the pool policy in template.yaml: 12+ chars, upper, lower, number.
+  const policyError = (p) => {
+    if (p.length < 12) return 'Use at least 12 characters.';
+    if (!/[a-z]/.test(p)) return 'Add a lowercase letter.';
+    if (!/[A-Z]/.test(p)) return 'Add an uppercase letter.';
+    if (!/[0-9]/.test(p)) return 'Add a number.';
+    return '';
+  };
+
+  form.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    err.textContent = '';
+    const e = email.value.trim();
+    const p = password.value;
+    if (!e || !p) { err.textContent = 'Enter email and password.'; return; }
+    btn.disabled = true;
+    btn.textContent = 'Signing in…';
+    const user = new AmazonCognitoIdentity.CognitoUser({ Username: e, Pool: pool });
+    const auth = new AmazonCognitoIdentity.AuthenticationDetails({ Username: e, Password: p });
+    user.authenticateUser(auth, {
+      onSuccess: () => location.replace(next),
+      onFailure: (x) => {
+        done();
+        err.textContent =
+          x.code === 'NotAuthorizedException' || x.code === 'UserNotFoundException'
+            ? 'Invalid credentials.'
+            : x.message || 'Sign-in failed.';
+      },
+      newPasswordRequired: () => {
+        done();
+        pendingUser = user;
+        npPassword.value = '';
+        npConfirm.value = '';
+        npErr.textContent = '';
+        form.hidden = true;
+        npForm.hidden = false;
+        npPassword.focus();
+      },
+    });
+  });
+
+  npForm.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    npErr.textContent = '';
+    const p = npPassword.value;
+    const problem = policyError(p);
+    if (problem) { npErr.textContent = problem; return; }
+    if (p !== npConfirm.value) { npErr.textContent = 'Passwords do not match.'; return; }
+    npBtn.disabled = true;
+    npBtn.textContent = 'Setting password…';
+    pendingUser.completeNewPasswordChallenge(p, {}, {
+      onSuccess: () => location.replace(next),
+      onFailure: (x) => {
+        npBtn.disabled = false;
+        npBtn.textContent = 'Set password';
+        npErr.textContent = x.message || 'Could not set password.';
+      },
+    });
+  });
+})();
+
+(function () {
+  const CONFIG = window.APP_CONFIG || {};
+  const v = document.getElementById('app-version');
+  if (v) {
+    const tagged = CONFIG.release && CONFIG.release !== 'dev';
+    v.textContent = tagged ? CONFIG.release : (CONFIG.build ? `dev (${CONFIG.build})` : 'dev');
+    if (CONFIG.build) v.title = `Build ${CONFIG.build}`;
+  }
+  const r = document.getElementById('app-repo');
+  if (r && CONFIG.repo) r.href = CONFIG.repo;
+
+  // Show "update available" only when the latest GitHub release is newer than
+  // the running one. Needs a public repo (the GitHub API is unauthenticated).
+  const m = (CONFIG.repo || '').match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/);
+  if (!m || !CONFIG.release || CONFIG.release === 'dev') return;
+
+  const parse = (s) => String(s).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const newer = (tag) => {
+    const a = parse(tag), b = parse(CONFIG.release);
+    for (let i = 0; i < 3; i++) {
+      if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
+    }
+    return false;
+  };
+  const show = (tag, url) => {
+    if (!tag || !newer(tag)) return;
+    const a = document.getElementById('app-update');
+    if (!a) return;
+    a.href = url || `${CONFIG.repo}/releases/tag/${tag}`;
+    a.textContent = `update available (${tag})`;
+    a.hidden = false;
+  };
+
+  // Cache for an hour so reloads stay well inside the unauthenticated rate limit.
+  const KEY = 'bivack-latest-release';
+  try {
+    const c = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (c && c.at && Date.now() - c.at < 3600000) { show(c.tag, c.url); return; }
+  } catch (e) { /* storage unavailable */ }
+
+  fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`, {
+    headers: { Accept: 'application/vnd.github+json' },
+  })
+    .then((resp) => (resp.ok ? resp.json() : null))
+    .then((rel) => {
+      if (!rel || !rel.tag_name) return;
+      try { localStorage.setItem(KEY, JSON.stringify({ tag: rel.tag_name, url: rel.html_url, at: Date.now() })); } catch (e) { /* ignore */ }
+      show(rel.tag_name, rel.html_url);
+    })
+    .catch(() => { /* offline or a private repo */ });
+})();
+</script>
+</body>
+</html>

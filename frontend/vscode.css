@@ -1,0 +1,181 @@
+/* VS Code "Dark Modern" tokens, shared by the chooser, login, and terminal
+   pages so they read as one product. Values are the theme's own colors. */
+:root {
+  --vscode-bg: #1f1f1f;          /* editor.background */
+  --vscode-chrome: #181818;      /* titleBar / sideBar / statusBar */
+  --vscode-input: #313131;       /* input.background */
+  --vscode-border: #2b2b2b;      /* panel / tab borders */
+  --vscode-border-strong: #3c3c3c;
+  --vscode-fg: #cccccc;          /* foreground */
+  --vscode-fg-dim: #9d9d9d;      /* descriptionForeground */
+  --vscode-accent: #0078d4;      /* button.background, focusBorder */
+  --vscode-accent-hover: #026ec1;
+  --vscode-accent-fg: #ffffff;
+  --vscode-link: #4daafc;        /* textLink.foreground */
+  --vscode-error: #f14c4c;
+  --vscode-hover: rgba(255, 255, 255, 0.12);
+  --vscode-list-hover: #2a2d2e;
+  --vscode-ui-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
+    Helvetica, Arial, sans-serif;
+  --vscode-mono-font: "SF Mono", Monaco, Menlo, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--vscode-bg);
+  color: var(--vscode-fg);
+  font-family: var(--vscode-ui-font);
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  /* Disable mobile font boosting so small/terminal text is not inflated. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+.win { display: flex; flex-direction: column; height: 100%; }
+
+/* Title bar: the strip that makes every page read as a VS Code window. */
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 35px;
+  flex-shrink: 0;
+  padding: 0 10px;
+  padding-top: env(safe-area-inset-top, 0px);
+  background: var(--vscode-chrome);
+  border-bottom: 1px solid var(--vscode-border);
+  color: var(--vscode-fg);
+}
+.titlebar .meta { color: var(--vscode-fg-dim); font-size: 12px; }
+.titlebar-right { display: flex; align-items: center; gap: 8px; }
+
+.brand {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--vscode-fg);
+}
+
+/* Tab strip: one active editor tab. */
+.tabbar {
+  display: flex;
+  align-items: stretch;
+  height: 35px;
+  flex-shrink: 0;
+  background: var(--vscode-chrome);
+  border-bottom: 1px solid var(--vscode-border);
+}
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  background: var(--vscode-bg);
+  color: var(--vscode-fg);
+  font-size: 13px;
+  border-right: 1px solid var(--vscode-border);
+}
+.tab .glyph { color: var(--vscode-accent); font-family: var(--vscode-mono-font); }
+
+/* Toolbar buttons (title bar actions). */
+.toolbar { display: flex; align-items: center; gap: 4px; }
+.tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 7px;
+  background: transparent;
+  color: var(--vscode-fg);
+  border: none;
+  border-radius: 5px;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.tool-btn:hover { background: var(--vscode-hover); }
+.tool-btn:active { background: rgba(255, 255, 255, 0.2); }
+.tool-btn:disabled { opacity: 0.4; cursor: default; }
+.tool-btn.danger:hover { background: rgba(241, 76, 76, 0.2); color: var(--vscode-error); }
+.tool-btn svg { display: block; }
+
+/* Dialog / widget panel. */
+.dialog {
+  width: 100%;
+  max-width: 400px;
+  background: #252526;
+  border: 1px solid var(--vscode-border-strong);
+  border-radius: 4px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  padding: 20px;
+  color: var(--vscode-fg);
+}
+.dialog h2 { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+.dialog .hint { color: var(--vscode-fg-dim); font-size: 13px; margin-bottom: 16px; }
+
+.field { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+
+input.vscode {
+  width: 100%;
+  padding: 7px 10px;
+  background: var(--vscode-input);
+  border: 1px solid var(--vscode-border-strong);
+  border-radius: 2px;
+  color: var(--vscode-fg);
+  font-size: 13px;
+  outline: none;
+  -webkit-appearance: none;
+}
+input.vscode:focus { border-color: var(--vscode-accent); }
+input.vscode::placeholder { color: var(--vscode-fg-dim); }
+
+button.vscode {
+  padding: 7px 16px;
+  background: var(--vscode-accent);
+  color: var(--vscode-accent-fg);
+  border: 1px solid transparent;
+  border-radius: 2px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+button.vscode:hover { background: var(--vscode-accent-hover); }
+button.vscode:disabled { opacity: 0.5; cursor: default; }
+
+.error { color: var(--vscode-error); font-size: 12px; min-height: 16px; margin-bottom: 12px; }
+
+/* Footer with the app version and a repo link. */
+.app-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+  padding: 6px 12px;
+  background: var(--vscode-chrome);
+  border-top: 1px solid var(--vscode-border);
+  color: var(--vscode-fg-dim);
+  font-size: 12px;
+}
+.app-footer a { color: var(--vscode-link); text-decoration: none; }
+.app-footer a:hover { text-decoration: underline; }
+.app-footer .update { color: var(--vscode-accent); font-weight: 600; }
+
+:focus-visible { outline: 1px solid var(--vscode-accent); outline-offset: 1px; }
+
+/* VS Code scrollbars. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(121, 121, 121, 0.4); }
+::-webkit-scrollbar-thumb:hover { background: rgba(121, 121, 121, 0.7); }
+::-webkit-scrollbar-track { background: transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

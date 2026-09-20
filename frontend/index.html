@@ -6,403 +6,67 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>rDev</title>
+  <title>Bivack</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#181818">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
   <!-- deploy.sh replaces the whole APP_CONFIG line with the real config JSON -->
   <script>window.APP_CONFIG = {}; /* APP_CONFIG_PLACEHOLDER */</script>
   <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@cocalc/xterm@5.5.0-cocalc.5/css/xterm.min.css">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body {
-      height: 100%;
-      background: #0d1117;
-      color: #e0e0e0;
-      font-family: -apple-system, 'SF Pro Text', sans-serif;
-      overflow: hidden;
-    }
-    /* Login screen */
-    #login-screen {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      height: 100%;
-      height: 100dvh;
-      /* iOS Safari doesn't shrink dvh for the keyboard — --app-height (set
-         from window.visualViewport, which DOES exclude the keyboard) does. */
-      height: var(--app-height, 100dvh);
-      background: #0d1117;
-      padding: 24px;
-      padding-top: max(24px, env(safe-area-inset-top, 0px));
-      padding-bottom: max(24px, env(safe-area-inset-bottom, 0px));
-    }
-    #login-screen h1 {
-      font-size: 28px;
-      font-weight: 700;
-      color: #58a6ff;
-      margin-bottom: 8px;
-    }
-    #login-screen p {
-      color: #8b949e;
-      font-size: 14px;
-      margin-bottom: 32px;
-    }
-    .login-form {
-      width: 100%;
-      max-width: 360px;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-    }
-    .login-form input {
-      width: 100%;
-      padding: 14px 16px;
-      background: #161b22;
-      border: 1px solid #30363d;
-      border-radius: 10px;
-      color: #e0e0e0;
-      font-size: 16px;
-      outline: none;
-      -webkit-appearance: none;
-    }
-    .login-form input:focus { border-color: #58a6ff; }
-    .login-form button {
-      width: 100%;
-      padding: 14px;
-      background: #238636;
-      color: white;
-      border: none;
-      border-radius: 10px;
-      font-size: 16px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    .login-form button:active { background: #2ea043; }
-    #login-error {
-      color: #f85149;
-      font-size: 13px;
-      text-align: center;
-      min-height: 18px;
-    }
-    #app {
-      display: flex;
-      flex-direction: column;
-      height: 100%;
-      height: 100dvh;
-      height: var(--app-height, 100dvh);
-    }
-    #header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 8px 16px;
-      padding-top: max(8px, env(safe-area-inset-top, 0px));
-      background: #16213e;
-      border-bottom: 1px solid #0f3460;
-      flex-shrink: 0;
-      min-height: 48px;
-      gap: 10px;
-    }
-    #header h1 {
-      font-size: 15px;
-      font-weight: 600;
-      color: #f0f6fc;
-      letter-spacing: 0.5px;
-    }
-    .brand {
-      display: inline-flex;
-      align-items: baseline;
-      gap: 1px;
-      font-family: "SF Mono", "Fira Code", Menlo, monospace;
-      letter-spacing: -0.8px;
-    }
-    .brand-mark {
-      color: #58a6ff;
-      font-style: italic;
-      font-weight: 800;
-    }
-    .brand-name {
-      color: #f0f6fc;
-      font-weight: 700;
-    }
-    #login-screen .brand {
-      letter-spacing: -1.5px;
-    }
-    #login-screen .brand-name {
-      color: #58a6ff;
-    }
-    #header-actions {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .hdr-btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      background: #0f3460;
-      color: #a8b2d8;
-      border: none;
-      border-radius: 8px;
-      font-size: 16px;
-      line-height: 1;
-      padding: 5px 12px;
-      min-height: 36px;
-      min-width: 36px;
-      cursor: pointer;
-    }
-    .hdr-btn:active { background: #1a4a8a; }
-    .hdr-btn:disabled { opacity: 0.4; cursor: default; }
-    #layout-btn { display: none; }
-    #terminate-btn:active { background: #4a1a1a; color: #f85149; }
-    /* Copy overlay: plain selectable text of the focused terminal's buffer,
-       so iOS long-press selection and the Copy callout work normally. */
-    #copy-overlay {
-      display: none;
-      position: fixed;
-      inset: 0;
-      z-index: 30;
-      background: #0d1117;
-      flex-direction: column;
-    }
-    #copy-overlay.open { display: flex; }
-    #copy-overlay-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 10px 16px;
-      padding-top: max(10px, env(safe-area-inset-top, 0px));
-      background: #16213e;
-      color: #a8b2d8;
-      font-size: 13px;
-      flex-shrink: 0;
-    }
-    #copy-overlay-text {
-      flex: 1;
-      overflow-y: auto;
-      -webkit-overflow-scrolling: touch;
-      margin: 0;
-      padding: 12px 16px calc(24px + env(safe-area-inset-bottom, 0px));
-      font-family: "SF Mono", "Fira Code", Menlo, monospace;
-      font-size: 13px;
-      line-height: 1.4;
-      color: #c9d1d9;
-      white-space: pre-wrap;
-      word-break: break-all;
-      -webkit-user-select: text;
-      user-select: text;
-    }
-    #status {
-      font-size: 12px;
-      padding: 3px 10px;
-      border-radius: 12px;
-      background: #0f3460;
-      color: #a8b2d8;
-    }
-    #status.connected { background: #1a4a1a; color: #4caf50; }
-    #build-tag { font-size: 10px; color: #4a5578; }
-    #status.error { background: #4a1a1a; color: #f44336; }
-    #status.warming { background: #3d2e0f; color: #d29922; }
-    /* Panes: stacked by default; .side-by-side lays them out in a row */
-    #panes {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      min-height: 0;
-      position: relative;
-      gap: 1px;
-      background: #0f3460; /* shows through the gap as a divider line */
-    }
-    #panes.side-by-side { flex-direction: row; }
-    /* Draggable divider between panes; ::before pads the touch hit area */
-    .pane-divider {
-      flex: 0 0 10px;
-      position: relative;
-      z-index: 4;
-      background: #0f3460;
-      touch-action: none;
-      cursor: row-resize;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .pane-divider::before { content: ''; position: absolute; inset: -8px 0; }
-    .pane-divider::after {
-      content: '';
-      width: 36px; height: 4px;
-      border-radius: 2px;
-      background: #30518a;
-    }
-    .pane-divider.dragging::after { background: #58a6ff; }
-    #panes.side-by-side .pane-divider { cursor: col-resize; }
-    #panes.side-by-side .pane-divider::before { inset: 0 -8px; }
-    #panes.side-by-side .pane-divider::after { width: 4px; height: 36px; }
-    .pane {
-      flex: 1;
-      min-width: 0;
-      min-height: 0;
-      position: relative;
-      background: #0d1117;
-      padding: 4px;
-      border: 1px solid transparent;
-    }
-    .pane.focused { border-color: #1f3a5f; }
-    .pane .term { width: 100%; height: 100%; }
-    /* iOS: momentum scrolling on xterm's scroll container */
-    .xterm .xterm-viewport { -webkit-overflow-scrolling: touch; }
-    /* Toast: transient confirmation (e.g. "URL copied") */
-    #toast {
-      position: fixed;
-      left: 50%;
-      bottom: calc(24px + env(safe-area-inset-bottom, 0px));
-      transform: translateX(-50%);
-      z-index: 40;
-      background: #16213e;
-      color: #c9d1d9;
-      border: 1px solid #30518a;
-      border-radius: 10px;
-      padding: 10px 16px;
-      font-size: 13px;
-      max-width: 80vw;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      cursor: pointer;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.2s;
-    }
-    #toast.show { opacity: 1; pointer-events: auto; }
-    .pane-close {
-      display: none;
-      position: absolute;
-      top: 6px;
-      right: 10px;
-      z-index: 5;
-      background: rgba(22, 33, 62, 0.85);
-      color: #8b949e;
-      border: 1px solid #30363d;
-      border-radius: 6px;
-      font-size: 15px;
-      line-height: 1;
-      padding: 10px 14px; /* comfortable touch target (~40px) */
-      cursor: pointer;
-    }
-    .pane-close:active { color: #f85149; border-color: #f85149; }
-    #panes.multi .pane-close { display: block; }
-    /* Special-keys row for touch devices — see the #keybar markup comment. */
-    #keybar {
-      display: none;
-      flex-shrink: 0;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      padding: 6px 10px;
-      background: #16213e;
-      border-top: 1px solid #0f3460;
-      overflow-x: auto;
-      -webkit-overflow-scrolling: touch;
-    }
-    #keybar.show { display: flex; }
-    .key-btn {
-      flex: 0 0 auto;
-      min-width: 40px;
-      min-height: 38px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      background: #0f3460;
-      color: #c9d1d9;
-      border: none;
-      border-radius: 8px;
-      font-size: 14px;
-      font-family: "SF Mono", "Fira Code", Menlo, monospace;
-      cursor: pointer;
-    }
-    .key-btn:active { background: #1a4a8a; }
-    #ctrl-key.active { background: #58a6ff; color: #0d1117; font-weight: 700; }
-    #loading {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      position: absolute;
-      inset: 0;
-      background: #0d1117;
-      gap: 16px;
-      color: #a8b2d8;
-      z-index: 10;
-    }
-    .spinner {
-      width: 40px;
-      height: 40px;
-      border: 3px solid #0f3460;
-      border-top-color: #e94560;
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    #error-banner {
-      display: none;
-      padding: 12px 16px;
-      background: #4a1a1a;
-      color: #f44336;
-      font-size: 13px;
-      text-align: center;
-    }
-    #reconnect-btn {
-      margin-top: 12px;
-      padding: 8px 20px;
-      background: #e94560;
-      color: white;
-      border: none;
-      border-radius: 8px;
-      font-size: 14px;
-      cursor: pointer;
-    }
-    /* iOS safe area */
-    @supports (padding: env(safe-area-inset-bottom)) {
-      #app { padding-bottom: env(safe-area-inset-bottom); }
-    }
-    /* Narrow screens (iPhone widths): the header was tuned for iPad and
-       doesn't fit an iPhone in one row at full size — tighten it up and
-       drop secondary label text, keeping every action reachable by icon. */
-    @media (max-width: 480px) {
-      #header { padding-left: 10px; padding-right: 10px; gap: 6px; }
-      #header-actions { gap: 6px; }
-      .hdr-btn { padding: 5px 9px; font-size: 15px; }
-      #split-btn .btn-label { display: none; }
-      #status { font-size: 11px; padding: 3px 8px; }
-      #build-tag { display: none; }
-    }
-  </style>
+  <link rel="stylesheet" href="/vscode.css">
+  <link rel="stylesheet" href="/cli.css">
 </head>
 <body>
 <!-- Login screen (shown first) -->
 <div id="login-screen">
-  <h1 class="brand" aria-label="rDev"><span class="brand-mark">r</span><span class="brand-name">Dev</span></h1>
-  <p>Remote developer workspace</p>
-  <div class="login-form">
-    <input type="email" id="login-email" placeholder="Email" autocomplete="email" inputmode="email">
-    <input type="password" id="login-password" placeholder="Password" autocomplete="current-password">
-    <div id="login-error"></div>
-    <button id="login-btn" onclick="doLogin()">Sign In</button>
+  <div class="dialog">
+    <h2>Sign in</h2>
+    <p class="hint">Use your account to continue.</p>
+    <div class="field">
+      <input class="vscode" type="email" id="login-email" placeholder="Email" autocomplete="email" inputmode="email">
+      <input class="vscode" type="password" id="login-password" placeholder="Password" autocomplete="current-password">
+    </div>
+    <div id="login-error" class="error"></div>
+    <button id="login-btn" class="vscode" onclick="doLogin()">Sign In</button>
   </div>
 </div>
 
 <!-- Terminal app (shown after login) -->
 <div id="app" style="display:none;">
   <div id="header">
-    <h1 class="brand" aria-label="rDev"><span class="brand-mark">r</span><span class="brand-name">Dev</span></h1>
+    <div class="titlebar-left">
+      <a class="hdr-btn" id="home-btn" href="/" title="Back to the chooser" aria-label="Back to the chooser">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.5 8H3.5"/><path d="M7 4L3 8l4 4"/></svg>
+      </a>
+      <h1 class="brand">Bivack</h1>
+    </div>
     <div id="header-actions">
-      <button class="hdr-btn" id="copy-btn" onclick="openCopyOverlay()" title="Select — view terminal text for copying">⧉</button>
-      <button class="hdr-btn" id="paste-btn" onclick="pasteClipboard()" title="Paste clipboard into the terminal">⌘V</button>
-      <button class="hdr-btn" id="split-btn" onclick="addPane()" title="Split — open another terminal">⊞<span class="btn-label"> Split</span></button>
-      <button class="hdr-btn" id="layout-btn" onclick="toggleLayout()" title="Toggle stacked / side-by-side panes">⬓</button>
-      <button class="hdr-btn" id="terminate-btn" onclick="terminateVm()" title="Terminate this VM (files persist; a fresh VM starts on reload)">⏻</button>
+      <button class="hdr-btn" id="copy-btn" onclick="openCopyOverlay()" title="Select terminal text to copy" aria-label="Copy terminal text">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5.75" y="5.75" width="7.5" height="7.5" rx="1.25"/><path d="M10.25 5.75V3.5A1.75 1.75 0 0 0 8.5 1.75h-5A1.75 1.75 0 0 0 1.75 3.5v5A1.75 1.75 0 0 0 3.5 10.25h2.25"/></svg>
+      </button>
+      <button class="hdr-btn" id="paste-btn" onclick="pasteClipboard()" title="Paste into the terminal" aria-label="Paste">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.75" y="2.75" width="8.5" height="11.5" rx="1.25"/><rect x="5.75" y="1.5" width="4.5" height="2.5" rx="0.9"/><path d="M6 7h4M6 9.5h3"/></svg>
+      </button>
+      <button class="hdr-btn" id="split-btn" onclick="addPane()" title="Split: open another terminal" aria-label="Split pane">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.25"/><path d="M8 2.75v10.5"/></svg>
+      </button>
+      <button class="hdr-btn" id="layout-btn" onclick="toggleLayout()" title="Toggle stacked or side-by-side panes" aria-label="Toggle pane layout">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.25"/><path d="M6.5 2.75v10.5"/><path d="M6.5 8h7.75"/></svg>
+      </button>
+      <button class="hdr-btn" id="terminate-btn" onclick="terminateVm()" title="Terminate this VM (files persist; a fresh VM starts on reload)" aria-label="Terminate VM">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.75v5.5"/><path d="M4.4 4.3a4.25 4.25 0 1 0 7.2 0"/></svg>
+      </button>
       <span id="status">Connecting…</span>
-      <span id="build-tag"></span>
+      <button class="hdr-btn" id="logout-btn" onclick="signOut()" title="Sign out" aria-label="Sign out">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6.5 2.5H3.5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h3"/>
+          <path d="M10 5l3 3-3 3"/>
+          <path d="M13 8H6.5"/>
+        </svg>
+        <span class="btn-label">Sign out</span>
+      </button>
     </div>
   </div>
   <div id="error-banner"></div>
@@ -447,14 +111,25 @@
 // ── Config ──────────────────────────────────────────────────────────────────
 const CONFIG = window.APP_CONFIG || {};
 const TOKEN_API_URL = CONFIG.tokenApiUrl || '';
-// Apple touch device (iPhone/iPad, incl. iPadOS masquerading as MacIntel)
+// Coarse-pointer touch device (phone/tablet). Android's soft keyboard lacks
+// Esc/Tab/Ctrl/arrows just like iOS's, so the key bar shows on any touch device.
+const COARSE_TOUCH = window.matchMedia?.('(hover: none) and (pointer: coarse)').matches ?? ('ontouchstart' in window);
+// Apple touch device (iPhone/iPad, incl. iPadOS masquerading as MacIntel) —
+// gates the iOS-specific touch selection/scroll handling below.
 const IS_APPLE_TOUCH = (/iPad|iPhone|iPod/.test(navigator.userAgent)
     || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
-  && (window.matchMedia?.('(hover: none) and (pointer: coarse)').matches ?? true);
-// Dev builds inject CONFIG.build (deploy-dev.sh); production leaves it unset.
-if (CONFIG.build) document.getElementById('build-tag').textContent = CONFIG.build;
+  && COARSE_TOUCH;
 // The on-screen keyboard has no Ctrl/Esc/Tab/arrows — only useful on touch.
-if (IS_APPLE_TOUCH) document.getElementById('keybar')?.classList.add('show');
+if (COARSE_TOUCH) document.getElementById('keybar')?.classList.add('show');
+
+// Installable PWA: a minimal pass-through service worker satisfies the browser
+// install criteria. It deliberately does NOT cache responses, so a redeploy is
+// never masked by a stale app shell.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  });
+}
 
 // ── Keep #app/#login-screen sized to the REAL visible area ────────────────────
 // iOS Safari does not honor `interactive-widget=resizes-content` (that's a
@@ -474,8 +149,8 @@ if (window.visualViewport) {
 }
 syncAppHeight();
 const MAX_PANES = 4;
-const PANES_STORAGE_KEY = 'ipad-claude-panes';
-const LAYOUT_STORAGE_KEY = 'ipad-claude-layout'; // 'stacked' (default) | 'side-by-side'
+const PANES_STORAGE_KEY = 'bivack-panes';
+const LAYOUT_STORAGE_KEY = 'bivack-layout'; // 'stacked' (default) | 'side-by-side'
 
 // ── Cognito auth ──────────────────────────────────────────────────────────────
 // amazon-cognito-identity-js persists sessions in localStorage and refreshes
@@ -561,8 +236,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Enter') doLogin();
   });
 
-  // Resume an existing Cognito session if one is stored and still valid.
-  getIdToken().then(() => showApp()).catch(() => {/* show login */});
+  // Resume an existing Cognito session if one is stored and still valid;
+  // otherwise hand off to the shared login page.
+  getIdToken().then(() => showApp()).catch(() => {
+    window.location.replace('../login/?next=' + encodeURIComponent('/cli/' + window.location.search));
+  });
 });
 
 // ── Shared connection state (token/endpoint are per-VM, shared by all panes) ──
@@ -756,16 +434,18 @@ class Pane {
     // Terminal
     this.terminal = new Terminal({
       theme: {
-        background: '#0d1117',
-        foreground: '#c9d1d9',
-        cursor: '#58a6ff',
-        black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
-        blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39c5cf', white: '#b1bac4',
-        brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364',
-        brightYellow: '#e3b341', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
-        brightCyan: '#56d4dd', brightWhite: '#f0f6fc',
+        background: '#1f1f1f',
+        foreground: '#cccccc',
+        cursor: '#ffffff',
+        cursorAccent: '#1f1f1f',
+        selectionBackground: '#264f78',
+        black: '#000000', red: '#cd3131', green: '#0dbc79', yellow: '#e5e510',
+        blue: '#2472c8', magenta: '#bc3fbc', cyan: '#11a8cd', white: '#e5e5e5',
+        brightBlack: '#666666', brightRed: '#f14c4c', brightGreen: '#23d18b',
+        brightYellow: '#f5f543', brightBlue: '#3b8eea', brightMagenta: '#d670d6',
+        brightCyan: '#29b8db', brightWhite: '#e5e5e5',
       },
-      fontFamily: '"SF Mono", "Fira Code", Menlo, monospace',
+      fontFamily: '"SF Mono", Monaco, Menlo, Consolas, "Liberation Mono", "Courier New", monospace',
       fontSize: 14,
       lineHeight: 1.3,
       scrollback: 5000,
@@ -1169,13 +849,17 @@ toastEl.addEventListener('click', () => {
   act?.();
 });
 
-// Tapping a URL in the terminal copies it; the toast offers "open" as the
-// follow-up. (Straight-to-open is hostile on touch, and clipboard writes
-// must happen inside the tap gesture anyway.)
+// Clicking a URL in the terminal. On desktop, open it directly. On touch, a
+// canvas tap can't reliably open a tab and the clipboard write must stay inside
+// the gesture, so copy it and offer a tap-to-open toast.
 function activateLink(event, uri) {
-  navigator.clipboard.writeText(uri)
-    .then(() => showToast(`Copied — tap to open: ${uri}`, () => window.open(uri, '_blank')))
-    .catch(() => { window.open(uri, '_blank'); }); // clipboard blocked: old behavior
+  if (COARSE_TOUCH) {
+    navigator.clipboard.writeText(uri)
+      .then(() => showToast(`Copied — tap to open: ${uri}`, () => window.open(uri, '_blank', 'noopener')))
+      .catch(() => { window.open(uri, '_blank', 'noopener'); });
+  } else {
+    window.open(uri, '_blank', 'noopener');
+  }
 }
 
 // ── Copy / paste (iOS has no terminal selection or Cmd+V) ─────────────────────
