@@ -76,17 +76,10 @@ Parameters:
     Type: Number
     Default: 25
     Description: "Monthly cost budget in USD; alerts at 80% and 100%."
-  BudgetEnabled:
-    Type: String
-    Default: "true"
-    AllowedValues: ["true", "false"]
-    Description: >-
-      Create the monthly cost budget. Set "false" in an Organization that blocks
-      budgets or handles cost alerts centrally.
   BudgetEmail:
     Type: String
     Default: ""
-    Description: "Budget alert recipient. Empty falls back to LoginEmail."
+    Description: "Budget alert recipient. Empty skips budget creation."
 
   NatMode:
     Type: String
@@ -101,8 +94,7 @@ Conditions:
   DeployImage: !Equals [!Ref DeployMicrovmImage, "true"]
   UseNatInstance: !Equals [!Ref NatMode, "instance"]
   UseNatGateway: !Equals [!Ref NatMode, "gateway"]
-  CreateBudget: !Equals [!Ref BudgetEnabled, "true"]
-  HasBudgetEmail: !Not [!Equals [!Ref BudgetEmail, ""]]
+  CreateBudget: !Not [!Equals [!Ref BudgetEmail, ""]]
 
 Globals:
   Function:
@@ -826,7 +818,7 @@ Resources:
             ThresholdType: PERCENTAGE
           Subscribers:
             - SubscriptionType: EMAIL
-              Address: !If [HasBudgetEmail, !Ref BudgetEmail, !Ref LoginEmail]
+              Address: !Ref BudgetEmail
         - Notification:
             NotificationType: ACTUAL
             ComparisonOperator: GREATER_THAN
@@ -834,7 +826,7 @@ Resources:
             ThresholdType: PERCENTAGE
           Subscribers:
             - SubscriptionType: EMAIL
-              Address: !If [HasBudgetEmail, !Ref BudgetEmail, !Ref LoginEmail]
+              Address: !Ref BudgetEmail
 
 Outputs:
   TokenApiUrl:
@@ -845,7 +837,7 @@ Outputs:
   UserPoolClientId:
     Value: !Ref UserPoolClient
   LoginEmail:
-    Description: The first-login and budget-alert address (LOGIN_EMAIL in deploy.env).
+    Description: The first-login address (LOGIN_EMAIL in deploy.env).
     Value: !Ref LoginEmail
   CreateUserCommand:
     Description: >-

@@ -7,7 +7,7 @@
 [![AWS SAM](https://img.shields.io/badge/AWS-SAM-orange)](https://aws.amazon.com/serverless/sam/)
 [![AWS Lambda MicroVMs](https://img.shields.io/badge/AWS-Lambda%20MicroVMs-FF9900)](https://aws.amazon.com/lambda/)
 
-Run [Claude Code](https://www.anthropic.com/claude-code), [Codex CLI](https://developers.openai.com/codex/cli/), [OpenCode](https://opencode.ai), and [Kiro CLI](https://kiro.dev/docs/cli/setup.md) in per-user **AWS Lambda MicroVMs**, each with a persistent **Amazon S3** home directory, reached from a browser terminal or a browser VS Code workbench.
+Run your selected [Claude Code](https://www.anthropic.com/claude-code), [Codex CLI](https://developers.openai.com/codex/cli/), [OpenCode](https://opencode.ai), and [Kiro CLI](https://kiro.dev/docs/cli/setup.md) coding agents in per-user **AWS Lambda MicroVMs**, each with a persistent **Amazon S3** home directory, reached from a browser terminal or a browser VS Code workbench.
 
 Each CLI uses the user's own provider login, so there are no shared API keys in the image. Close the tab and come back: files, history, and every login are still there.
 
@@ -39,11 +39,14 @@ Bivack is built on [Remote Developer (rDev)](https://github.com/singledigit/micr
 git clone https://github.com/gunnargrosch/bivack
 cd bivack
 cp deploy.env.example deploy.env
-$EDITOR deploy.env          # AWS_PROFILE, AWS_REGION, LOGIN_EMAIL
+$EDITOR deploy.env          # AWS_PROFILE, AWS_REGION, LOGIN_EMAIL; select tools
 ./scripts/deploy.sh
 ```
 
 The first run bootstraps the stack, builds the IDE, packages the MicroVM image, uploads the frontend, creates your first login, smoke-tests a throwaway VM, and prints the URL. Later runs reuse whatever has not changed.
+
+Claude Code is enabled in the generated `deploy.env`. Uncomment Codex, OpenCode,
+or Kiro there to add them before the first deploy.
 
 | Requirement | Notes |
 | --- | --- |
@@ -81,14 +84,14 @@ flowchart TD
 | **Frontend** | Chooser at `/`, terminal at `/cli/`, VS Code workbench at `/ide/`, shared login at `/login/`. Static from S3 behind CloudFront. The terminal installs as a PWA and shows a touch key bar on any coarse-pointer device. In the workbench, the File menu's "Go to Bivack Home" returns to the chooser. |
 | **Auth** | Cognito user pool, admin-created users only. API Gateway's Cognito authorizer validates the JWT before the token Lambda runs. |
 | **Token Lambda** | Reads the verified `sub`, finds-or-creates that user's S3 Files access point (`/users/<sub>`), launches or resumes their MicroVM, and mints a short-lived auth token. Hand-rolled SigV4. |
-| **MicroVM image** | Amazon Linux 2023 with Node, Python 3.13, git, `gh`, the AWS CLI, `uv`, and the four coding CLIs. `terminal.js` serves the PTY over WebSocket; `ide-agent.js` serves the workbench's file system and terminal on a second port. |
+| **MicroVM image** | Amazon Linux 2023 with Node, Python 3.13, git, `gh`, the AWS CLI, `uv`, and the coding agent CLIs selected in `deploy.env`. `terminal.js` serves the PTY over WebSocket; `ide-agent.js` serves the workbench's file system and terminal on a second port. |
 | **Home** | The `/run` lifecycle hook mounts the per-user S3 Files access point at `/home/coder` (`mount -o accesspoint=<id>`), so each user's home is isolated and survives restarts. |
 | **Egress** | The private subnets reach the internet through a NAT instance by default (a `t4g.nano` running `iptables` masquerade, about $3/month) or an AWS NAT Gateway when `NAT_MODE=gateway` (about $33/month). This is the path MicroVMs use to reach model providers and package registries. The instance is patched weekly by an SSM association (`AWS-RunPatchBaseline`); a NAT Gateway needs no patching. |
 | **Web search** | Each CLI uses its own built-in web tools; no MCP server is wired up. |
 
 ## Terminals and CLIs
 
-Each CLI signs in once and keeps its session under `/home/coder`.
+Each selected CLI signs in once and keeps its session under `/home/coder`.
 
 | CLI | Command | First-run login |
 | --- | --- | --- |
@@ -97,7 +100,7 @@ Each CLI signs in once and keeps its session under `/home/coder`.
 | OpenCode | `opencode` | `/connect` to add a provider |
 | Kiro CLI | `kiro-cli` | `kiro-cli login` (device flow) |
 
-All of them share workspace files while keeping their own configuration and history. Each is configured for unattended work inside its dedicated MicroVM: Claude Code uses `bypassPermissions`, Codex bypasses approvals and its local sandbox, and Kiro has a persistent allow-all policy. The MicroVM is the isolation boundary.
+Selected tools share workspace files while keeping their own configuration and history. Each is configured for unattended work inside its dedicated MicroVM: Claude Code uses `bypassPermissions`, Codex bypasses approvals and its local sandbox, and Kiro has a persistent allow-all policy. The MicroVM is the isolation boundary.
 
 **Kiro CLI** is a hosted service unrelated to your AWS account. The browser terminal has no local browser, so `kiro-cli login` prints a URL and a one-time code; open it anywhere, sign in, and the session is stored under `~/.kiro` for good. Check it with `kiro-cli whoami`.
 
@@ -111,17 +114,46 @@ All of them share workspace files while keeping their own configuration and hist
 | --- | --- |
 | `AWS_PROFILE` | named AWS CLI profile (leave unset for the default profile) |
 | `AWS_REGION` | region to deploy into |
-| `LOGIN_EMAIL` | first Cognito login; deploy.sh creates it, and the monthly budget alerts here by default |
+| `LOGIN_EMAIL` | first Cognito login; deploy.sh creates it on the first deployment |
 | `INITIAL_PASSWORD` | optional; temporary password for the first login, default random |
 | `STACK_NAME` | optional, defaults to `bivack`; prefixes every AWS resource |
 | `MEMORY_MIB` | optional; MicroVM memory tier (512, 1024, 2048, 4096, 8192), default 4096 |
 | `IDLE_MAX_SECONDS` | optional; seconds without inbound traffic before a VM suspends, default 7200 |
 | `IDLE_SUSPEND_SECONDS` | optional; seconds a suspended VM stays resumable, default 1800 |
 | `MAX_LIFETIME_SECONDS` | optional; hard maximum VM lifetime, default 28800 |
-| `BUDGET_USD` | optional; monthly cost budget in USD, default 25 |
-| `BUDGET_ENABLED` | optional; `true` (default) creates the monthly budget, `false` skips it |
-| `BUDGET_EMAIL` | optional; budget alert recipient, defaults to `LOGIN_EMAIL` |
+| `BUDGET_EMAIL` | optional; enables monthly budget alerts at this address; unset disables budget creation |
+| `BUDGET_USD` | optional; monthly cost budget in USD, default 25; used only when `BUDGET_EMAIL` is set |
 | `NAT_MODE` | optional; private-subnet egress: `instance` (default, ~$3/mo) or `gateway` (~$33/mo) |
+**Coding agents**
+
+| Key | Meaning |
+| --- | --- |
+| `CLAUDE` | coding agent CLI version; enabled as `latest` in `deploy.env.example` |
+| `CODEX`, `OPENCODE`, `KIRO` | optional coding agent CLI versions; unset by default |
+
+**Other tools**
+
+| Key | Meaning |
+| --- | --- |
+| `CDK`, `SAM`, `TOFU`, `TERRAFORM` | optional infrastructure CLI versions; unset by default |
+
+Tool settings control what is baked into every MicroVM. Unset, commented-out,
+or empty disables a tool; `latest` selects the current release; and a version
+pins it. For example:
+
+```shell
+CLAUDE=latest           # install the current release
+# OPENCODE=latest       # commented out disables it
+KIRO=                   # empty also disables it
+TOFU=1.12.6             # install this pinned release
+```
+
+Leave a tool setting unset to keep it out of the image. A tool setting change
+changes the packaged MicroVM source hash, so the next `./scripts/deploy.sh`
+rebuilds the image automatically. `TOFU=latest` and `TERRAFORM=latest` resolve
+their version during deployment, which is printed before the image is packaged.
+They are supported for convenience, but pinning their versions is recommended
+for reproducible images.
 
 ### What deploy.sh does
 
@@ -129,7 +161,8 @@ All of them share workspace files while keeping their own configuration and hist
 2. First deploy only: bootstraps the stack without the MicroVM image, to create the buckets and roles.
 3. Builds the IDE when its sources changed (or `ide/dist` is missing).
 4. Packages `microvm/` and deploys the stack with the image.
-5. Uploads the frontend and IDE to S3 and invalidates CloudFront.
+5. Uploads the frontend and IDE to S3 and invalidates CloudFront when their
+   source, built IDE assets, or generated runtime configuration changed.
 6. Creates the first login from `LOGIN_EMAIL` with a random temporary password, printed once by the deploy and changed on first sign-in.
 7. Launches a throwaway MicroVM, probes the S3 Files mount and outbound internet, then terminates it.
 
@@ -142,6 +175,7 @@ All of them share workspace files while keeping their own configuration and hist
 | `--no-smoke` | skip the throwaway smoke-test VM |
 | `--build-ide` | force an IDE rebuild |
 | `--review` | show the CloudFormation changeset and confirm before applying |
+| `--dry-run` | on an existing stack, create but do not execute a CloudFormation changeset; skips frontend publishing, login creation, and smoke testing |
 
 ### Upgrading
 
@@ -152,7 +186,7 @@ git pull
 ./scripts/deploy.sh
 ```
 
-`deploy.sh` rebuilds only what changed: the IDE when its sources changed, the MicroVM image when `microvm/` changed (5-10 minutes), and the frontend every time. The S3 Files home and the buckets are not touched, so user files, history, and logins survive. Keep `STACK_NAME` unchanged; a different name stands up a new stack instead of upgrading.
+`deploy.sh` rebuilds only what changed: the IDE when its sources changed, the MicroVM image when `microvm/` changed (5-10 minutes), and the frontend when its source, built IDE assets, or generated runtime configuration changed. A no-change run skips the IDE rebuild, MicroVM artifact upload, frontend publishing, and CloudFront invalidation; it still runs SAM's no-op deploy check and the smoke test (unless `--no-smoke` is set). The S3 Files home and the buckets are not touched, so user files, history, and logins survive. Keep `STACK_NAME` unchanged; a different name stands up a new stack instead of upgrading.
 
 After a MicroVM image upgrade, running VMs keep the old image until they recycle (they suspend on idle and terminate after their maximum lifetime). To move a user onto the new image immediately, terminate their VM from the terminal's power button and reload; the next sign-in launches a fresh VM from the newest image.
 

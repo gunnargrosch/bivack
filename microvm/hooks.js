@@ -13,6 +13,7 @@ const MOUNT_PATH = '/home/coder';
 const AP_FILE = '/tmp/access-point-id';
 const MVM_ID_FILE = '/tmp/microvm-id';
 const MVM_EP_FILE = '/tmp/microvm-endpoint';
+const agentTools = new Set((process.env.BIVACK_AGENT_TOOLS || '').split(',').filter(Boolean));
 
 // The public endpoint isn't derivable from the VM id and may not be in the
 // /run envelope — ask the control plane about ourselves (the execution role
@@ -78,13 +79,20 @@ const server = http.createServer((req, res) => {
     // Contract: 503 while working, 200 when done (platform polls).
     if (!validateStarted) {
       validateStarted = true;
+      const agentValidation = [];
+      if (agentTools.has('claude')) agentValidation.push('sudo -u coder HOME=/home/coder claude --version');
+      if (agentTools.has('codex')) agentValidation.push('sudo -u coder HOME=/home/coder codex --version');
+      if (agentTools.has('opencode')) agentValidation.push('sudo -u coder HOME=/home/coder opencode --version');
+      if (agentTools.has('kiro')) {
+        agentValidation.push(
+          'timeout 30 kiro-cli --version || true',
+          'timeout 30 kiro-cli-chat --version || true',
+          'timeout 30 kiro-cli-term --version || true',
+        );
+      }
       const child = spawn('/bin/sh', ['-c', [
         // the real session cold path
-        'sudo -u coder HOME=/home/coder claude --version',
-        'sudo -u coder HOME=/home/coder codex --version',
-        'timeout 30 kiro-cli --version || true',
-        'timeout 30 kiro-cli-chat --version || true',
-        'timeout 30 kiro-cli-term --version || true',
+        ...agentValidation,
         'bash -lc true', 'zsh -lc true || true', 'git --version',
         // the mount toolchain: a REAL mount attempt (bogus access point, so it
         // fails after exercising python3.13, the helpers, and efs-proxy — the

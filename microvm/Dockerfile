@@ -76,26 +76,6 @@ RUN mkdir -p /opt/uv/bin /opt/uv/cache /opt/uv/tool /opt/uv/toolbin /opt/uv/pyth
     && ln -sf /opt/uv/bin/uvx /usr/local/bin/uvx \
     && chown -R 1000:1000 /opt/uv
 
-# Coding CLIs. Claude Code and OpenCode are installed globally; Codex lives
-# under /opt so the system-owned wrapper below can invoke a stable binary path.
-# Each user's configuration, history, and login state sit in the mounted S3
-# Files home, so provider logins survive VM recycles.
-RUN npm install -g @anthropic-ai/claude-code opencode-ai \
-    && npm install --prefix /opt/codex --omit=dev @openai/codex@latest \
-    && /opt/codex/node_modules/.bin/codex --version \
-    && npm cache clean --force
-
-# Kiro CLI — standalone binaries. The installer places them under root's home
-# even when INSTALL_DIR is supplied, so move the complete CLI family to
-# /usr/local/bin in the same image layer. `kiro-cli login` then stores its
-# device-flow session under the invoking user's persistent home directory.
-RUN curl -fsSL https://cli.kiro.dev/install | bash \
-    && install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli \
-    && install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat \
-    && install -m 0755 /root/.local/bin/kiro-cli-term /usr/local/bin/kiro-cli-term \
-    && rm -rf /root/.local/bin \
-    && (kiro-cli settings "app.disableAutoupdates" "true" 2>/dev/null || true)
-
 # App infrastructure lives at /opt/app — never shadowed by the S3 mount
 WORKDIR /opt/app
 RUN npm init -y && npm install node-pty ws && npm cache clean --force
@@ -108,7 +88,15 @@ COPY ide-agent.js /opt/app/ide-agent.js
 COPY shell/env.sh /opt/app/shell-env.sh
 COPY codex/run.sh /usr/local/bin/codex
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /usr/local/bin/codex
+COPY install-agent-tools.sh /usr/local/bin/install-agent-tools
+COPY agent-tools.env /tmp/agent-tools.env
+COPY install-optional-tools.sh /usr/local/bin/install-optional-tools
+COPY optional-tools.env /tmp/optional-tools.env
+RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /usr/local/bin/codex \
+      /usr/local/bin/install-agent-tools /usr/local/bin/install-optional-tools \
+    && /usr/local/bin/install-agent-tools /tmp/agent-tools.env \
+    && /usr/local/bin/install-optional-tools /tmp/optional-tools.env \
+    && rm -f /tmp/agent-tools.env /tmp/optional-tools.env
 
 # App user — NO -m flag: /home/coder must be empty so S3 Files can mount over it.
 # zsh is the login shell.
@@ -162,6 +150,7 @@ EOF
 # under /home/coder.
 ENV HOME=/home/coder
 ENV S3_FILES_FS_ID=__S3_FILES_FS_ID__
+ENV BIVACK_AGENT_TOOLS=__AGENT_TOOLS__
 ENV AWS_REGION=us-east-1
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 ENV DISABLE_AUTOUPDATER=1

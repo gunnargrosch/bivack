@@ -130,11 +130,17 @@ const WAIT_TIMEOUT_MS = 240000;
 // Startup banner. Printed here (once, right after the mount) rather than from
 // the seedable rc files: a first-connect shell could read ~/.zshrc while the
 // home was still being seeded and show only part of it. One broadcast is atomic.
+const AGENT_CLI_HINTS = {
+  claude: "  Claude Code: 'claude' (log in once, then /model to switch)",
+  codex: "  Codex: 'codex' (log in once, then /model to switch)",
+  opencode: "  OpenCode: 'opencode' (run /connect once to add a provider)",
+  kiro: "  Kiro CLI: 'kiro-cli login' once, then 'kiro-cli'",
+};
 const CLI_HINTS = [
-  "  Claude Code: 'claude' (log in once, then /model to switch)",
-  "  Codex: 'codex' (log in once, then /model to switch)",
-  "  OpenCode: 'opencode' (run /connect once to add a provider)",
-  "  Kiro CLI: 'kiro-cli login' once, then 'kiro-cli'",
+  ...(process.env.BIVACK_AGENT_TOOLS || '')
+    .split(',')
+    .map(tool => AGENT_CLI_HINTS[tool])
+    .filter(Boolean),
   '  Workspace: /home/coder  (persistent S3 storage)',
 ];
 function cliBanner() {

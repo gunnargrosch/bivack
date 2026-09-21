@@ -6,6 +6,7 @@ node_modules/
 # IDE (VS Code workbench) build output
 ide/dist/
 ide/.build-hash
+frontend/.deploy-hash
 
 # SAM build artifacts
 .aws-sam/

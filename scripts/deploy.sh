@@ -8,6 +8,7 @@
 #   ./scripts/deploy.sh --no-smoke      skip the throwaway smoke-test VM
 #   ./scripts/deploy.sh --build-ide     force an IDE rebuild
 #   ./scripts/deploy.sh --review        show the changeset and confirm before applying
+#   ./scripts/deploy.sh --dry-run       create a changeset without applying it
 #
 # Configuration lives in deploy.env (untracked; created from deploy.env.example
 # on first run).
@@ -16,17 +17,26 @@ set -euo pipefail
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(unset CDPATH; cd "$SCRIPT_DIR/.." && pwd)"
 
+# Prefer Homebrew's AWS CLI when present: the macOS standalone installer may
+# remain earlier on PATH and lack newer services such as Lambda MicroVMs.
+if command -v brew >/dev/null 2>&1; then
+  BREW_AWS_BIN="$(brew --prefix awscli 2>/dev/null)/bin"
+  [ -x "$BREW_AWS_BIN/aws" ] && export PATH="$BREW_AWS_BIN:$PATH"
+fi
+
 FRONTEND_ONLY=false
 NO_SMOKE=false
 BUILD_IDE=false
 REVIEW=false
+DRY_RUN=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --frontend-only) FRONTEND_ONLY=true; shift ;;
     --no-smoke)      NO_SMOKE=true; shift ;;
     --build-ide)     BUILD_IDE=true; shift ;;
     --review)        REVIEW=true; shift ;;
-    -h|--help)       sed -n '2,11p' "$0"; exit 0 ;;
+    --dry-run)       DRY_RUN=true; shift ;;
+    -h|--help)       sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -56,16 +66,50 @@ IDLE_MAX_SECONDS="${IDLE_MAX_SECONDS:-7200}"
 IDLE_SUSPEND_SECONDS="${IDLE_SUSPEND_SECONDS:-1800}"
 MAX_LIFETIME_SECONDS="${MAX_LIFETIME_SECONDS:-28800}"
 BUDGET_USD="${BUDGET_USD:-25}"
-BUDGET_ENABLED="${BUDGET_ENABLED:-true}"
 BUDGET_EMAIL="${BUDGET_EMAIL:-}"
 NAT_MODE="${NAT_MODE:-instance}"
+# Tool settings control the image directly: unset or empty disables the tool,
+# `latest` selects the current release, and a version pins it.
+CLAUDE="${CLAUDE:-}"
+CODEX="${CODEX:-}"
+OPENCODE="${OPENCODE:-}"
+KIRO="${KIRO:-}"
+CDK="${CDK:-}"
+SAM="${SAM:-}"
+TOFU="${TOFU:-}"
+TERRAFORM="${TERRAFORM:-}"
 # Temporary password for the first auto-created login. Random by default;
 # override with INITIAL_PASSWORD in deploy.env. The pool policy needs 12+ chars
 # with upper, lower, and a digit, so build a value that always satisfies it.
 INITIAL_PASSWORD="${INITIAL_PASSWORD:-$(python3 -c 'import secrets,string; a=string.ascii_letters+string.digits; pw=[secrets.choice(string.ascii_uppercase),secrets.choice(string.ascii_lowercase),secrets.choice(string.digits)]+[secrets.choice(a) for _ in range(13)]; secrets.SystemRandom().shuffle(pw); print("".join(pw))')}"
 SAM_PROFILE=()
 [ -n "${AWS_PROFILE:-}" ] && SAM_PROFILE=(--profile "$AWS_PROFILE")
-PARAM_OVERRIDES="LoginEmail=\"$LOGIN_EMAIL\" MicrovmMemoryMiB=$MEMORY_MIB IdleMaxSeconds=$IDLE_MAX_SECONDS IdleSuspendSeconds=$IDLE_SUSPEND_SECONDS MaxLifetimeSeconds=$MAX_LIFETIME_SECONDS MonthlyBudgetUsd=$BUDGET_USD BudgetEnabled=$BUDGET_ENABLED BudgetEmail=\"$BUDGET_EMAIL\" NatMode=$NAT_MODE"
+PARAM_OVERRIDES="LoginEmail=\"$LOGIN_EMAIL\" MicrovmMemoryMiB=$MEMORY_MIB IdleMaxSeconds=$IDLE_MAX_SECONDS IdleSuspendSeconds=$IDLE_SUSPEND_SECONDS MaxLifetimeSeconds=$MAX_LIFETIME_SECONDS MonthlyBudgetUsd=$BUDGET_USD BudgetEmail=\"$BUDGET_EMAIL\" NatMode=$NAT_MODE"
+
+valid_tool_version() {
+  [[ "$1" =~ ^latest$|^[0-9]+(\.[0-9]+){1,3}([.-][0-9A-Za-z]+)*$ ]]
+}
+
+# Generated tool config files are sourced during the Docker build. Keep their
+# values deliberately narrow so deploy.env cannot inject shell into the image.
+for version_var in CLAUDE CODEX OPENCODE CDK SAM TOFU TERRAFORM; do
+  version="${!version_var}"
+  if [ -n "$version" ] && ! valid_tool_version "$version"; then
+    err "$version_var must be empty, 'latest', or a version such as 1.12.6."
+    exit 2
+  fi
+done
+if [ -n "$KIRO" ] && [ "$KIRO" != "latest" ]; then
+  err "KIRO must be empty or 'latest'; the Kiro installer does not support version pinning."
+  exit 2
+fi
+
+resolve_latest_tofu() {
+  python3 -c 'import json, urllib.request; print(json.load(urllib.request.urlopen("https://api.github.com/repos/opentofu/opentofu/releases/latest"))["tag_name"].removeprefix("v"))'
+}
+resolve_latest_terraform() {
+  python3 -c 'import json, urllib.request; print(json.load(urllib.request.urlopen("https://checkpoint-api.hashicorp.com/v1/check/terraform"))["current_version"])'
+}
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 missing=()
@@ -76,6 +120,10 @@ if [ "${#missing[@]}" -gt 0 ]; then
   err "Missing required tools: ${missing[*]}"
   echo "  Install: awscli (https://aws.amazon.com/cli), sam (https://docs.aws.amazon.com/serverless-application-model),"
   echo "           node 20+, zip, python3."
+  exit 1
+fi
+if ! aws lambda-microvms help >/dev/null 2>&1; then
+  err "AWS CLI does not support Lambda MicroVMs. Upgrade AWS CLI v2, then retry."
   exit 1
 fi
 
@@ -104,19 +152,34 @@ sam_build() {
   (cd "$ROOT_DIR" && sam build --parallel --template template.yaml)
 }
 sam_deploy() {
-  # --review keeps sam's own changeset prompt so stateful replacements are
-  # visible before they are applied. Default is to deploy without prompting.
+  # --review keeps SAM's changeset prompt so stateful replacements are visible
+  # before they are applied. --dry-run always creates a non-executing
+  # changeset; it must remain non-interactive for CI and local preview use.
   local confirm=()
-  [ "$REVIEW" = false ] && confirm=(--no-confirm-changeset)
+  local dry_run=()
+  if [ "$DRY_RUN" = true ]; then
+    confirm=(--no-confirm-changeset)
+    dry_run=(--no-execute-changeset)
+  elif [ "$REVIEW" = false ]; then
+    confirm=(--no-confirm-changeset)
+  fi
   (cd "$ROOT_DIR" && sam deploy \
     --stack-name "$STACK_NAME" --region "$AWS_REGION" ${SAM_PROFILE[@]+"${SAM_PROFILE[@]}"} \
     --capabilities CAPABILITY_NAMED_IAM --resolve-s3 \
-    ${confirm[@]+"${confirm[@]}"} --no-fail-on-empty-changeset \
+    ${confirm[@]+"${confirm[@]}"} ${dry_run[@]+"${dry_run[@]}"} --no-fail-on-empty-changeset \
     --parameter-overrides "$@")
 }
 
 if [ "$FRONTEND_ONLY" = true ] && ! stack_exists; then
   err "Stack '$STACK_NAME' does not exist; --frontend-only needs an existing deploy."
+  exit 1
+fi
+if [ "$DRY_RUN" = true ] && [ "$FRONTEND_ONLY" = true ]; then
+  err "--dry-run cannot be combined with --frontend-only; frontend uploads have no CloudFormation changeset."
+  exit 2
+fi
+if [ "$DRY_RUN" = true ] && ! stack_exists; then
+  err "--dry-run requires an existing stack; it will not bootstrap a new one."
   exit 1
 fi
 
@@ -151,6 +214,37 @@ fi
 
 # ── Package the MicroVM source and deploy the stack ───────────────────────────
 if [ "$FRONTEND_ONLY" = false ]; then
+  if [ "$TOFU" = "latest" ]; then
+    log "Resolving latest OpenTofu version..."
+    if ! TOFU=$(resolve_latest_tofu); then
+      err "Could not resolve the latest OpenTofu version."
+      exit 1
+    fi
+    if ! valid_tool_version "$TOFU" || [ "$TOFU" = "latest" ]; then
+      err "OpenTofu release lookup returned an invalid version."
+      exit 1
+    fi
+    ok "OpenTofu: $TOFU"
+  fi
+  if [ "$TERRAFORM" = "latest" ]; then
+    log "Resolving latest Terraform version..."
+    if ! TERRAFORM=$(resolve_latest_terraform); then
+      err "Could not resolve the latest Terraform version."
+      exit 1
+    fi
+    if ! valid_tool_version "$TERRAFORM" || [ "$TERRAFORM" = "latest" ]; then
+      err "Terraform release lookup returned an invalid version."
+      exit 1
+    fi
+    ok "Terraform: $TERRAFORM"
+  fi
+  agent_tools=()
+  [ -n "$CLAUDE" ] && agent_tools+=(claude)
+  [ -n "$CODEX" ] && agent_tools+=(codex)
+  [ -n "$OPENCODE" ] && agent_tools+=(opencode)
+  [ -n "$KIRO" ] && agent_tools+=(kiro)
+  AGENT_TOOLS=$(IFS=,; echo "${agent_tools[*]}")
+
   ARTIFACT_BUCKET=$(out ArtifactBucketName)
   if [ -z "$ARTIFACT_BUCKET" ] || [ "$ARTIFACT_BUCKET" = "None" ]; then
     err "Stack is missing the artifact bucket output; delete the stack and retry."
@@ -166,21 +260,42 @@ if [ "$FRONTEND_ONLY" = false ]; then
   rm -rf "$BUILD_DIR"; cp -R "$ROOT_DIR/microvm" "$BUILD_DIR"
   S3_FILES_FS_ID=$(out S3FilesFileSystemId)
   sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$BUILD_DIR/Dockerfile"
+  sed -i.bak "s|^ENV BIVACK_AGENT_TOOLS=.*|ENV BIVACK_AGENT_TOOLS=${AGENT_TOOLS}|" "$BUILD_DIR/Dockerfile"
   rm -f "$BUILD_DIR/Dockerfile.bak"
-  find "$BUILD_DIR" -exec touch -t 202001010000.00 {} + 2>/dev/null || true
-  ZIP_PATH="/tmp/bivack-microvm.zip"
-  rm -f "$ZIP_PATH"
-  (cd "$BUILD_DIR" && zip -r "$ZIP_PATH" . -x "*.DS_Store" > /dev/null)
+  cat > "$BUILD_DIR/agent-tools.env" <<EOF
+CLAUDE=$CLAUDE
+CODEX=$CODEX
+OPENCODE=$OPENCODE
+KIRO=$KIRO
+EOF
+  cat > "$BUILD_DIR/optional-tools.env" <<EOF
+CDK=$CDK
+SAM=$SAM
+TOFU=$TOFU
+TERRAFORM=$TERRAFORM
+EOF
   ZIP_HASH=$(cd "$BUILD_DIR" && /usr/bin/find . -type f -print0 \
     | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
   ZIP_KEY="microvm/bivack-microvm-${ZIP_HASH}.zip"
   MICROVM_CODE_URI="s3://$ARTIFACT_BUCKET/$ZIP_KEY"
-  aws s3 cp "$ZIP_PATH" "s3://$ARTIFACT_BUCKET/$ZIP_KEY" >/dev/null
-  ok "Source uploaded ($ZIP_KEY)"
+  if aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "$ZIP_KEY" >/dev/null 2>&1; then
+    ok "MicroVM source up to date ($ZIP_KEY)"
+  else
+    find "$BUILD_DIR" -exec touch -t 202001010000.00 {} + 2>/dev/null || true
+    ZIP_PATH="/tmp/bivack-microvm.zip"
+    rm -f "$ZIP_PATH"
+    (cd "$BUILD_DIR" && zip -r "$ZIP_PATH" . -x "*.DS_Store" > /dev/null)
+    aws s3 cp "$ZIP_PATH" "s3://$ARTIFACT_BUCKET/$ZIP_KEY" >/dev/null
+    ok "Source uploaded ($ZIP_KEY)"
+  fi
 
   log "Deploying stack (a MicroVM image build here can take 5-10 min)..."
   sam_build
   sam_deploy "MicrovmCodeUri=$MICROVM_CODE_URI DeployMicrovmImage=true $PARAM_OVERRIDES"
+  if [ "$DRY_RUN" = true ]; then
+    ok "Change set created (not executed)"
+    exit 0
+  fi
   ok "Stack deployed"
 else
   log "Frontend-only: reusing existing stack."
@@ -217,61 +332,81 @@ render_page() {
   rm -f "$out_file"
 }
 
-log "Uploading frontend..."
-render_page "$ROOT_DIR/frontend/landing.html" "index.html"
-render_page "$ROOT_DIR/frontend/index.html"   "cli/index.html"
-render_page "$ROOT_DIR/frontend/login.html"   "login/index.html"
-[ -f "$ROOT_DIR/frontend/manifest.webmanifest" ] && aws s3 cp "$ROOT_DIR/frontend/manifest.webmanifest" \
-  "s3://$FRONTEND_BUCKET/cli/manifest.webmanifest" --cache-control "no-cache" --content-type "application/manifest+json" >/dev/null
-[ -f "$ROOT_DIR/frontend/sw.js" ] && aws s3 cp "$ROOT_DIR/frontend/sw.js" \
-  "s3://$FRONTEND_BUCKET/cli/sw.js" --cache-control "no-cache" --content-type "application/javascript" >/dev/null
-[ -f "$ROOT_DIR/frontend/icon.svg" ] && aws s3 cp "$ROOT_DIR/frontend/icon.svg" \
-  "s3://$FRONTEND_BUCKET/cli/icon.svg" --cache-control "max-age=86400" --content-type "image/svg+xml" >/dev/null
-# Stylesheets (vscode.css plus one per page).
-for css in "$ROOT_DIR"/frontend/*.css; do
-  aws s3 cp "$css" "s3://$FRONTEND_BUCKET/$(basename "$css")" \
-    --cache-control "no-cache" --content-type "text/css" >/dev/null
-done
+hash_tree() {
+  find "$1" -type f ! -name ".deploy-hash" -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
+}
+FRONTEND_HASH=$({
+  printf '%s\n' "$APP_CONFIG_JSON"
+  hash_tree "$ROOT_DIR/frontend"
+  [ -d "$ROOT_DIR/ide/dist" ] && hash_tree "$ROOT_DIR/ide/dist"
+} | shasum -a 256 | cut -c1-16)
+FRONTEND_STAMP_FILE="$ROOT_DIR/frontend/.deploy-hash"
+FRONTEND_STAMP=$(cat "$FRONTEND_STAMP_FILE" 2>/dev/null || echo "")
 
-if [ -d "$ROOT_DIR/ide/dist" ]; then
-  log "Uploading the IDE..."
-  (
-    cd "$ROOT_DIR/ide/dist"
-    find . -type f | while read -r f; do
-      key="ide/${f#./}"
-      case "$key" in
-        ide/index.html|ide/config.json) cc="no-cache, no-store, must-revalidate" ;;
-        *) cc="public, max-age=31536000, immutable" ;;
-      esac
-      case "$f" in
-        *.js|*.css|*.json|*.html|*.svg|*.txt|*.map)
-          case "$f" in
-            *.js) ct="text/javascript" ;;
-            *.css) ct="text/css" ;;
-            *.json) ct="application/json" ;;
-            *.html) ct="text/html" ;;
-            *.svg) ct="image/svg+xml" ;;
-            *.txt) ct="text/plain" ;;
-            *.map) ct="application/json" ;;
-          esac
-          gzip -9 -c "$f" > /tmp/bivack-gz
-          aws s3 cp /tmp/bivack-gz "s3://$FRONTEND_BUCKET/$key" \
-            --content-encoding gzip --content-type "$ct" --cache-control "$cc" >/dev/null
-          ;;
-        *) aws s3 cp "$f" "s3://$FRONTEND_BUCKET/$key" --cache-control "$cc" >/dev/null ;;
-      esac
-    done
-  )
-  rm -f /tmp/bivack-gz
-  printf '%s' "$APP_CONFIG_JSON" > /tmp/bivack-ide-config.json
-  aws s3 cp /tmp/bivack-ide-config.json "s3://$FRONTEND_BUCKET/ide/config.json" \
-    --cache-control "no-cache" --content-type "application/json" >/dev/null
-fi
+if [ "$FRONTEND_HASH" = "$FRONTEND_STAMP" ]; then
+  ok "Frontend up to date"
+else
+  log "Uploading frontend..."
+  render_page "$ROOT_DIR/frontend/landing.html" "index.html"
+  render_page "$ROOT_DIR/frontend/index.html"   "cli/index.html"
+  render_page "$ROOT_DIR/frontend/login.html"   "login/index.html"
+  [ -f "$ROOT_DIR/frontend/manifest.webmanifest" ] && aws s3 cp "$ROOT_DIR/frontend/manifest.webmanifest" \
+    "s3://$FRONTEND_BUCKET/cli/manifest.webmanifest" --cache-control "no-cache" --content-type "application/manifest+json" >/dev/null
+  [ -f "$ROOT_DIR/frontend/sw.js" ] && aws s3 cp "$ROOT_DIR/frontend/sw.js" \
+    "s3://$FRONTEND_BUCKET/cli/sw.js" --cache-control "no-cache" --content-type "application/javascript" >/dev/null
+  [ -f "$ROOT_DIR/frontend/icon.svg" ] && aws s3 cp "$ROOT_DIR/frontend/icon.svg" \
+    "s3://$FRONTEND_BUCKET/cli/icon.svg" --cache-control "max-age=86400" --content-type "image/svg+xml" >/dev/null
+  # Stylesheets (vscode.css plus one per page).
+  for css in "$ROOT_DIR"/frontend/*.css; do
+    aws s3 cp "$css" "s3://$FRONTEND_BUCKET/$(basename "$css")" \
+      --cache-control "no-cache" --content-type "text/css" >/dev/null
+  done
 
-if [ -n "$CF_DIST_ID" ] && [ "$CF_DIST_ID" != "None" ]; then
-  aws cloudfront create-invalidation --distribution-id "$CF_DIST_ID" --paths "/*" >/dev/null
+  if [ -d "$ROOT_DIR/ide/dist" ]; then
+    log "Uploading the IDE..."
+    IDE_GZ_FILE=$(mktemp /tmp/bivack-gz.XXXXXX)
+    cleanup_ide_gz() { rm -f "$IDE_GZ_FILE"; }
+    trap cleanup_ide_gz EXIT
+    (
+      cd "$ROOT_DIR/ide/dist"
+      find . -type f | while read -r f; do
+        key="ide/${f#./}"
+        case "$key" in
+          ide/index.html|ide/config.json) cc="no-cache, no-store, must-revalidate" ;;
+          *) cc="public, max-age=31536000, immutable" ;;
+        esac
+        case "$f" in
+          *.js|*.css|*.json|*.html|*.svg|*.txt|*.map)
+            case "$f" in
+              *.js) ct="text/javascript" ;;
+              *.css) ct="text/css" ;;
+              *.json) ct="application/json" ;;
+              *.html) ct="text/html" ;;
+              *.svg) ct="image/svg+xml" ;;
+              *.txt) ct="text/plain" ;;
+              *.map) ct="application/json" ;;
+            esac
+            gzip -9 -c "$f" > "$IDE_GZ_FILE"
+            aws s3 cp "$IDE_GZ_FILE" "s3://$FRONTEND_BUCKET/$key" \
+              --content-encoding gzip --content-type "$ct" --cache-control "$cc" >/dev/null
+            ;;
+          *) aws s3 cp "$f" "s3://$FRONTEND_BUCKET/$key" --cache-control "$cc" >/dev/null ;;
+        esac
+      done
+    )
+    cleanup_ide_gz
+    trap - EXIT
+    printf '%s' "$APP_CONFIG_JSON" > /tmp/bivack-ide-config.json
+    aws s3 cp /tmp/bivack-ide-config.json "s3://$FRONTEND_BUCKET/ide/config.json" \
+      --cache-control "no-cache" --content-type "application/json" >/dev/null
+  fi
+
+  if [ -n "$CF_DIST_ID" ] && [ "$CF_DIST_ID" != "None" ]; then
+    aws cloudfront create-invalidation --distribution-id "$CF_DIST_ID" --paths "/*" >/dev/null
+  fi
+  printf '%s' "$FRONTEND_HASH" > "$FRONTEND_STAMP_FILE"
+  ok "Frontend uploaded and CDN invalidated"
 fi
-ok "Frontend uploaded and CDN invalidated"
 
 # ── First login user ──────────────────────────────────────────────────────────
 CREATE_USER_CMD="aws cognito-idp admin-create-user --user-pool-id $USER_POOL_ID --username $LOGIN_EMAIL --user-attributes Name=email,Value=$LOGIN_EMAIL Name=email_verified,Value=true --temporary-password 'YOUR_TEMP_PASSWORD'"
@@ -313,15 +448,19 @@ if [ "$NO_SMOKE" = false ] && [ "$FRONTEND_ONLY" = false ]; then
     --root-directory 'path=/users/_smoketest,creationPermissions={ownerUid=1000,ownerGid=1000,permissions=0755}' \
     --query 'accessPointId' --output text 2>/dev/null || echo "")
 
-  RUN_OUT=$(aws lambda-microvms run-microvm \
-    --image-identifier "$IMAGE_ID" \
-    --execution-role-arn "$EXECUTION_ROLE" \
-    --idle-policy "{\"maxIdleDurationSeconds\":$IDLE_MAX_SECONDS,\"suspendedDurationSeconds\":$IDLE_SUSPEND_SECONDS,\"autoResumeEnabled\":true}" \
-    --maximum-duration-in-seconds "$MAX_LIFETIME_SECONDS" \
-    --ingress-network-connectors "[\"arn:aws:lambda:${AWS_REGION}:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:${AWS_REGION}:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
-    $EGRESS_FLAG \
-    ${SMOKE_AP:+--run-hook-payload "{\"accessPointId\":\"$SMOKE_AP\"}"} \
-    --output json 2>&1)
+  if ! RUN_OUT=$(aws lambda-microvms run-microvm \
+      --image-identifier "$IMAGE_ID" \
+      --execution-role-arn "$EXECUTION_ROLE" \
+      --idle-policy "{\"maxIdleDurationSeconds\":$IDLE_MAX_SECONDS,\"suspendedDurationSeconds\":$IDLE_SUSPEND_SECONDS,\"autoResumeEnabled\":true}" \
+      --maximum-duration-in-seconds "$MAX_LIFETIME_SECONDS" \
+      --ingress-network-connectors "[\"arn:aws:lambda:${AWS_REGION}:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:${AWS_REGION}:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
+      $EGRESS_FLAG \
+      ${SMOKE_AP:+--run-hook-payload "{\"accessPointId\":\"$SMOKE_AP\"}"} \
+      --output json 2>&1); then
+    err "Could not launch the smoke-test VM:"
+    echo "$RUN_OUT" | tail -20 >&2
+    PROBE_FAILED=true
+  fi
 
   MVM_ID=$(echo "$RUN_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('microvmId',''))" 2>/dev/null || echo "")
   MVM_ENDPOINT=$(echo "$RUN_OUT" | python3 -c "
@@ -332,8 +471,9 @@ print(ep if ep.startswith('https://') else 'https://' + ep)
 " 2>/dev/null || echo "")
 
   if [ -z "$MVM_ID" ]; then
-    err "Could not launch the smoke-test VM:"
-    echo "$RUN_OUT" | tail -20 >&2
+    [ -n "$SMOKE_AP" ] && [ "$SMOKE_AP" != "None" ] \
+      && aws s3files delete-access-point --access-point-id "$SMOKE_AP" >/dev/null 2>&1 || true
+    MVM_STATE="failed to launch"
   else
     ok "Smoke VM: $MVM_ID"
     sleep 15
