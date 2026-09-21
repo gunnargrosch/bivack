@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-09-21
+
+### Added
+
+- **Configurable image tools.** Choose coding agents and optional infrastructure CLIs in `deploy.env`, using a current release, a pinned version, or an explicit disable.
+- **Deployment previews.** `./scripts/deploy.sh --dry-run` creates a CloudFormation changeset without applying it.
+
+### Changed
+
+- **Budget alerts are explicit.** Set `BUDGET_EMAIL` to create a monthly budget; leave it unset to skip one.
+- **No-change deploys are quieter.** They skip frontend publishing, CloudFront invalidation, and MicroVM artifact uploads when their inputs are unchanged.
+- **Claude Code is the default agent.** The generated `deploy.env` enables it while keeping the other agents opt-in.
+- **Chooser screenshot refreshed.**
+
+### Fixed
+
+- **Concurrent frontend deploys.** IDE asset uploads use isolated temporary files instead of sharing one path.
+- **Smoke-test prerequisites.** Deployment detects AWS CLI installations that lack Lambda MicroVM support before applying a stack update.
+
 ## [0.1.0] - 2026-09-20
 
 ### Added
