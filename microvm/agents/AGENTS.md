@@ -40,14 +40,10 @@ persistence rules.
 ## Credentials and AWS access
 - Each CLI authenticates with the user's own provider login, persisted under
   the home directory (`~/.claude`, `~/.codex`, `~/.kiro`, `~/.config/opencode`).
-- The VM starts with no AWS credentials. To use AWS, authenticate as the user
-  inside the VM: `aws configure sso` once, then
-  `aws sso login --profile <name> --use-device-code`. Always name the profile
-  or `--sso-session`; a bare `aws sso login` resolves the `default` profile and
-  fails if it has no SSO keys. Always pass `--use-device-code`; there is no
-  browser here and the Authorization Code flow redirects to this VM's
-  `127.0.0.1`, which the user's browser cannot reach. Credentials and profiles
-  persist under `~/.aws` in the home.
+- The VM starts with no AWS credentials. To use AWS, authenticate as the user:
+  `aws configure sso`, then `aws sso login --profile <name> --use-device-code`.
+  Name a profile and pass `--use-device-code`; without them the login cannot
+  complete here. Credentials and profiles persist under `~/.aws` in the home.
 - The VM's own IAM role is limited to the S3 Files mount and an endpoint
   lookup, so it grants nothing against the user's accounts.
 - `gh` (GitHub CLI) is installed. Sign in over HTTPS with the device flow:
